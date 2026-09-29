@@ -38,6 +38,7 @@ API key is needed.
 ## Configuration
 
 - **Notebook**: `TILE_DEG` (0.1° keeps one tile ≈ 1000×1000 px in memory),
+  `TILE_WORKERS` (tiles in parallel; ~1–1.5 GB RAM each, 2–3 on standard Colab),
   `YEAR`, `MONTHS`, `STAGE_METHOD` (`dominant` / `midmonth`),
   `DATE_MEDIAN_RADIUS`, `SAVE_PHENOLOGY_BANDS`, `TILE_CACHE_DIR`.
 - **`data_processing` module settings** can be changed from the notebook
@@ -76,19 +77,39 @@ peak; `10` too few clear observations, `11` no interior peak, `12` amplitude
 too small, `13` peak NDVI too low, `14` base NDVI too high, `15` no rising
 15 % crossing, `16` season length implausible.
 
+## Performance
+
+- **One catalog search per province.** Sentinel-2 and WorldCover are each
+  searched once, and every tile filters those results locally. Asset URLs are
+  signed when each file is read (`patch_url=planetary_computer.sign`), so the
+  results stay valid for a multi-hour province run.
+- **Cropland first.** Each tile reads the one-band WorldCover map before any
+  Sentinel-2 data. Tiles with no cropland are skipped, and Sentinel-2 is read
+  only over the bounding box of the tile's cropland.
+- **Only tiles inside the province outline** are processed.
+- **Parallel tiles.** Use `tile_workers` / `TILE_WORKERS`.
+- **One GCS listing.** The batch run checks for existing outputs with a single
+  listing of `GCS_PREFIX` instead of one request per month.
+
 ## How failures are handled
 
 - **Tiles outside the province outline** (e.g. open sea inside a coastal
   province's bounding box) are dropped before processing (`geometry=`).
-- **Offshore tiles**: before any Sentinel-2 data is downloaded, a cheap
-  WorldCover search is run for the tile. If it finds no item, the tile is
-  skipped.
+- **Offshore tiles**: a tile with no WorldCover item is skipped before any
+  Sentinel-2 data is downloaded.
 - **Failed image reads**: an `odc` "src.crs is not None" assertion (usually an
-  expired access token) triggers a fresh, re-signed catalog search and a retry.
+  expired access token) triggers a retry, and every URL is re-signed on that
+  read.
+- **Empty province search**: if the province-wide Sentinel-2 search returns
+  nothing after its retries, the province is reported as failed rather than
+  "no coverage", because that is almost always a temporary Planetary Computer
+  problem.
 - **Per-tile retries**: each tile gets `tile_retries` extra attempts. If a tile
   still fails, the province is reported as failed so `skip_existing` retries it
   on the next batch run. With `cache_dir` set, finished tiles are saved to disk
-  and reused on that rerun, so a large province doesn't start over.
+  and reused on that rerun, so a large province doesn't start over. Offshore
+  and no-cropland tiles are cached as skip markers, so a rerun doesn't
+  re-check them.
   **The cache key is year + planting month + tile bounds only.** Use a new
   `TILE_CACHE_DIR` (or empty it) after changing `PHENO_CFG` or `dp.*`
   settings.
