@@ -288,14 +288,7 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     out["max_gap_days"] = np.where(ok, gaps.max(0) * dt, np.nan).astype(np.float32)
 
     # ---- clean + smooth -------------------------------------------------
-    Xc = _despike(X, c["DESPIKE_DROP"], c["DESPIKE_MIN_NEIGHBOR"])
-    F = gap_fill_linear(Xc)
-    F = np.where(ok[None, :], F, 0.0)                       # keep SG NaN-free
-    win = min(c["SG_WINDOW"], T if T % 2 == 1 else T - 1)
-    win = max(win, c["SG_POLYORDER"] + 2 + (c["SG_POLYORDER"] % 2 == 1))
-    if win % 2 == 0:
-        win += 1
-    S = savgol_filter(F, win, c["SG_POLYORDER"], axis=0, mode="interp").astype(np.float32)
+    F, S = _clean_and_smooth(X, c, ok)
     G = np.gradient(S, dt, axis=0)                          # dNDVI_s/dt  (per day)
     G2 = np.gradient(G, dt, axis=0)                         # d2NDVI_s/dt2
 
@@ -435,29 +428,45 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     return out
 
 
+def _clean_and_smooth(X, c, ok):
+    """Despike -> linear gap-fill -> Savitzky-Golay. X (T, N); ok (N,) marks
+    pixels with enough observations (others are zeroed so SG stays NaN-free).
+    Returns (F gap-filled, S smoothed), both float32 (T, N)."""
+    T = X.shape[0]
+    F = gap_fill_linear(_despike(X, c["DESPIKE_DROP"], c["DESPIKE_MIN_NEIGHBOR"]))
+    F = np.where(ok[None, :], F, 0.0).astype(np.float32)
+    win = min(c["SG_WINDOW"], T if T % 2 == 1 else T - 1)
+    win = max(win, c["SG_POLYORDER"] + 2 + (c["SG_POLYORDER"] % 2 == 1))
+    if win % 2 == 0:
+        win += 1
+    S = savgol_filter(F, win, c["SG_POLYORDER"], axis=0, mode="interp").astype(np.float32)
+    return F, S
+
+
 def smooth_series(X, cfg=None):
-    """Convenience for plotting: the exact cleaned + SG-smoothed curve,
-    G(t) and G'(t) used by extract_phenology. X: (T,) or (T, N)."""
+    """Convenience for plotting: the exact cleaned + SG-smoothed curve used
+    by extract_phenology (same window rules and MIN_OBS masking).
+    X: (T,) or (T, N). Returns (S, F)."""
     c = dict(DEFAULTS); c.update(cfg or {})
     X = np.asarray(X, np.float32)
     one = X.ndim == 1
     X = X[:, None] if one else X
-    F = gap_fill_linear(_despike(X, c["DESPIKE_DROP"], c["DESPIKE_MIN_NEIGHBOR"]))
-    S = savgol_filter(np.nan_to_num(F), c["SG_WINDOW"], c["SG_POLYORDER"],
-                      axis=0, mode="interp")
+    ok = np.isfinite(X).sum(0) >= c["MIN_OBS"]
+    F, S = _clean_and_smooth(X, c, ok)
     return (S[:, 0], F[:, 0]) if one else (S, F)
 
 
 # ==================================================================
 # Pixelwise run over a datacube  (replaces run_cnnlstm_inference)
 # ==================================================================
-def run_phenology(ds, batch_size=BATCH_PIXELS, **overrides):
+def run_phenology(ds, batch_size=None, **overrides):
     """
     ds : Dataset with NDVI (time, y, x) + attrs window_start.
     Returns a Dataset of (y, x) float32 products (see module docstring).
     Non-crop / masked pixels (all-NaN series) come out NaN everywhere
     (qc = NaN), so they stay nodata rather than "no rice".
     """
+    batch_size = batch_size or BATCH_PIXELS
     da = ds[NDVI_BAND]
     y_dim, x_dim = ds.attrs.get("spatial_dims") or [d for d in da.dims if d != "time"]
     arr = da.transpose("time", y_dim, x_dim).values.astype(np.float32)

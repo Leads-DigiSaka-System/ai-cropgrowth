@@ -121,7 +121,8 @@ def season_window(planting_month, year):
 planting_window = season_window          # alias: same name as the S1 module
 
 
-def anchor_dates(start_date, end_date, interval_days=INTERVAL_DAYS):
+def anchor_dates(start_date, end_date, interval_days=None):
+    interval_days = interval_days or INTERVAL_DAYS
     d0, d1 = pd.Timestamp(start_date), pd.Timestamp(end_date)
     n = int((d1 - d0).days // interval_days) + 1
     return pd.DatetimeIndex([d0 + pd.Timedelta(days=interval_days * k) for k in range(n)])
@@ -130,14 +131,14 @@ def anchor_dates(start_date, end_date, interval_days=INTERVAL_DAYS):
 # ==================================================================
 # 2. Per-scene NDVI from raw L2A DN (pure NumPy, testable offline)
 # ==================================================================
-def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time,
-                  clear_classes=SCL_CLEAR_CLASSES):
+def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time, clear_classes=None):
     """
     red_dn, nir_dn : uint16 DN arrays (0 = nodata)
     scl            : SCL class array (same shape)
     acq_time       : acquisition date (decides whether the BOA offset applies)
     Returns float32 NDVI with NaN for nodata / cloud / shadow.
     """
+    clear_classes = SCL_CLEAR_CLASSES if clear_classes is None else clear_classes
     red = np.asarray(red_dn, dtype=np.float32)
     nir = np.asarray(nir_dn, dtype=np.float32)
     valid = (red > 0) & (nir > 0) & np.isin(np.asarray(scl), clear_classes)
@@ -155,8 +156,8 @@ def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time,
 # ==================================================================
 # 3. MPC Sentinel-2 L2A loader  (STAC -> xarray -> per-scene NDVI)
 # ==================================================================
-def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=GRID_SCALE_DEG,
-                       max_cloud=MAX_SCENE_CLOUD, pool=8):
+def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
+                       max_cloud=None, pool=8):
     """
     Per-scene NDVI cube (time, y, x) float32 on an EPSG:4326 grid at
     `resolution`, cloud-masked with SCL. None if no scenes.
@@ -165,6 +166,9 @@ def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=GRID_SCALE_DEG,
     import odc.stac
     import time as _t
     from rasterio.errors import RasterioIOError, WarpOperationError
+
+    resolution = resolution or GRID_SCALE_DEG
+    max_cloud = MAX_SCENE_CLOUD if max_cloud is None else max_cloud
 
     def _search():
         catalog = _open_catalog()                       # fresh signing
@@ -191,7 +195,10 @@ def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=GRID_SCALE_DEG,
                 pool=pool,
             )
             break
-        except (RasterioIOError, WarpOperationError) as e:
+        except (RasterioIOError, WarpOperationError, AssertionError) as e:
+            # AssertionError: odc's `src.crs is not None` check fires when a COG
+            # read returns a non-georeferenced response (expired SAS / HTTP
+            # error page). A fresh search re-signs every asset URL.
             if attempt < 3:
                 print(f"    S2 read retry {attempt+1}/3 ({e.__class__.__name__}) — re-signing")
                 _t.sleep(2 ** attempt); continue
@@ -214,12 +221,14 @@ def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=GRID_SCALE_DEG,
 # 4. Temporal compositing to regular anchor dates
 # ==================================================================
 def composite_to_anchors(da_scene, start_date, end_date,
-                         interval_days=INTERVAL_DAYS, method=COMPOSITE_METHOD):
+                         interval_days=None, method=None):
     """
     Bin scenes into [anchor - dt/2, anchor + dt/2) and reduce with max (MVC)
     or median, ignoring NaN. Empty bins stay NaN — gap filling happens in
     phenology.py so it can count real observations and flag long gaps.
     """
+    interval_days = interval_days or INTERVAL_DAYS
+    method = method or COMPOSITE_METHOD
     anchors = anchor_dates(start_date, end_date, interval_days)
     half = pd.Timedelta(days=interval_days / 2)
     t = pd.DatetimeIndex(da_scene["time"].values)
@@ -246,30 +255,39 @@ WORLDCOVER_COLLECTION = "esa-worldcover"
 WORLDCOVER_CROPLAND_CLASS = 40
 
 
-def cropland_mask_on_grid(target_da, cropland_class=WORLDCOVER_CROPLAND_CLASS):
-    """Boolean (y, x) mask aligned to target_da (True = cropland)."""
-    import odc.stac
+class NoWorldCoverError(RuntimeError):
+    """ESA WorldCover has no item for the bbox (open sea / outside coverage)."""
+
+
+def worldcover_items(bbox, retries=4):
+    """WorldCover STAC items for bbox, with retry. Raises NoWorldCoverError if
+    none come back — WorldCover has no tiles over open sea, so a tile that
+    falls entirely offshore lands here and can be skipped."""
     import time as _t
+    items = []
+    for i in range(retries):
+        items = _open_catalog().search(collections=[WORLDCOVER_COLLECTION],
+                                       bbox=list(bbox)).item_collection()
+        if len(items) > 0:
+            return items
+        if i < retries - 1:
+            _t.sleep(2 ** i)
+    raise NoWorldCoverError(f"ESA WorldCover returned no items for bbox {list(bbox)}")
+
+
+def cropland_mask_on_grid(target_da, cropland_class=WORLDCOVER_CROPLAND_CLASS,
+                          items=None):
+    """Boolean (y, x) mask aligned to target_da (True = cropland).
+    `items`: pre-fetched worldcover_items() (searched here if None)."""
+    import odc.stac
 
     y = target_da["y"].values
     x = target_da["x"].values
     res = GRID_SCALE_DEG
     bbox = [float(x.min()) - res / 2, float(y.min()) - res / 2,
             float(x.max()) + res / 2, float(y.max()) + res / 2]
-
-    items = []
-    for i in range(4):
-        cat = _open_catalog()
-        items = cat.search(collections=[WORLDCOVER_COLLECTION],
-                           bbox=bbox).item_collection()
-        if len(items) > 0:
-            break
-        if i < 3:
-            _t.sleep(2 ** i)
-    if len(items) == 0:
-        raise RuntimeError(
-            f"ESA WorldCover returned no items for bbox {bbox} after retries "
-            f"(transient MPC STAC issue) — failing so skip_existing can retry.")
+    if items is None:
+        items = worldcover_items(bbox)
 
     lc = odc.stac.load(items, bands=["map"], bbox=bbox,
                        crs="EPSG:4326", resolution=res, chunks=None)
@@ -289,9 +307,21 @@ def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True
     """
     bbox : (west, south, east, north) EPSG:4326
     Returns Dataset {NDVI (time, y, x)} ready for phenology.run_phenology,
-    or None if no S2 coverage for the window.
+    or None if no S2 coverage for the window, or no WorldCover coverage
+    (tile entirely offshore).
     """
     start, end = season_window(planting_month, year)
+    wc_items = None
+    if apply_cropland_mask:
+        # cheap STAC search BEFORE the heavy S2 read: offshore tiles have no
+        # WorldCover item, so they are skipped without downloading S2 at all
+        try:
+            wc_items = worldcover_items(bbox)
+        except NoWorldCoverError:
+            print(f"  no WorldCover coverage for {tuple(round(v, 4) for v in bbox)} "
+                  f"(offshore) — skipping")
+            return None
+
     scenes = load_s2_ndvi_stack(bbox, start, end)
     if scenes is None or scenes.sizes.get("time", 0) == 0:
         print(f"  no S2 L2A coverage for {start}..{end} — skipping")
@@ -301,7 +331,7 @@ def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True
     del scenes
 
     if apply_cropland_mask:
-        mask = cropland_mask_on_grid(cube.isel(time=0, drop=True))
+        mask = cropland_mask_on_grid(cube.isel(time=0, drop=True), items=wc_items)
         cube = cube.where(mask)
 
     ds = cube.astype("float32").to_dataset(name=NDVI_BAND)
@@ -314,7 +344,10 @@ def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True
 # ==================================================================
 # 7. Tiled province builder (memory-bounded)
 # ==================================================================
-def generate_tiles(bbox, tile_deg=0.1):
+def generate_tiles(bbox, tile_deg=0.1, geometry=None):
+    """Regular tile grid over bbox. With `geometry` (EPSG:4326 polygon(s)),
+    tiles that do not intersect it (e.g. open sea inside a coastal
+    province's bounding box) are dropped."""
     w, s, e, n = bbox
     nx = max(1, int(np.ceil((e - w) / tile_deg - 1e-9)))
     ny = max(1, int(np.ceil((n - s) / tile_deg - 1e-9)))
@@ -324,22 +357,30 @@ def generate_tiles(bbox, tile_deg=0.1):
         for iy in range(ny):
             y0 = s + iy * tile_deg
             tiles.append((x0, y0, min(x0 + tile_deg, e), min(y0 + tile_deg, n)))
+    if geometry is not None:
+        from shapely.geometry import box
+        from shapely.ops import unary_union
+        from shapely.prepared import prep
+        shape = prep(unary_union(_as_geometry_list(geometry)))
+        tiles = [tb for tb in tiles if shape.intersects(box(*tb))]
     return tiles
 
 
-def _province_grid_coords(bbox, res=GRID_SCALE_DEG):
+def _province_grid_coords(bbox, res=None):
+    res = res or GRID_SCALE_DEG
     w, s, e, n = bbox
     xs = np.arange(w + res / 2, e, res)
     ys = np.arange(n - res / 2, s, -res)
     return ys, xs
 
 
-def _mosaic_tiles(pairs, bbox, res=GRID_SCALE_DEG):
+def _mosaic_tiles(pairs, bbox, res=None):
     """
     Merge per-tile Datasets onto ONE province grid. Every data_var is
     mosaicked (2-D (y,x) products or 3-D (time,y,x) cubes). Each province
     pixel belongs to exactly one tile by its centre (half-open bins).
     """
+    res = res or GRID_SCALE_DEG
     pairs = [(d, tb) for d, tb in pairs if d is not None]
     if not pairs:
         return None
@@ -368,8 +409,43 @@ def _mosaic_tiles(pairs, bbox, res=GRID_SCALE_DEG):
     return ds
 
 
+def _tile_cache_path(cache_dir, tb, planting_month, year):
+    import os
+    w, s, e, n = tb
+    return os.path.join(cache_dir, f"tile_{year}_{planting_month:02d}_"
+                                   f"{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}.npz")
+
+
+def _save_tile(path, ds):
+    """Tile Dataset -> .npz (vars, coords, attrs as JSON). No netCDF backend needed."""
+    import json, os
+    arrays = {f"var__{v}": ds[v].values for v in ds.data_vars}
+    arrays.update({f"coord__{c}": ds[c].values for c in ds.coords})
+    meta = {"dims": {v: list(ds[v].dims) for v in ds.data_vars},
+            "attrs": {k: (v.tolist() if hasattr(v, "tolist") else v)
+                      for k, v in ds.attrs.items()}}
+    arrays["meta"] = np.array(json.dumps(meta, default=str))
+    tmp = path + ".part.npz"                                  # atomic write
+    np.savez_compressed(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def _load_tile(path):
+    import json
+    with np.load(path, allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"]))
+        coords = {k[len("coord__"):]: z[k] for k in z.files if k.startswith("coord__")}
+        data = {k[len("var__"):]: (meta["dims"][k[len("var__"):]], z[k])
+                for k in z.files if k.startswith("var__")}
+    ds = xr.Dataset(data, coords=coords)
+    ds.attrs.update(meta["attrs"])
+    return ds
+
+
 def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
-                                  per_tile_fn=None, apply_cropland_mask=True):
+                                  per_tile_fn=None, apply_cropland_mask=True,
+                                  geometry=None, tile_retries=2, cache_dir=None,
+                                  allow_failed_tiles=False):
     """
     Tiled province builder.
 
@@ -380,25 +456,71 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                            outputs are kept and mosaicked, so peak memory is one
                            tile cube. Phenology is per-pixel in time, so tiling
                            introduces no seams.
+    geometry    : province polygon(s), EPSG:4326. Tiles outside it (open sea
+                  inside the bbox) are not processed.
+    tile_retries: extra attempts per tile after an error before it counts as failed.
+    cache_dir   : if set, each finished tile's output is saved there and reused
+                  on the next run, so a failed province resumes instead of
+                  restarting. Tiles with no coverage are not cached.
+                  The cache key is (year, planting month, tile bbox) only — use
+                  a separate cache_dir per config/season, or empty it after
+                  changing INTERVAL_DAYS, the cropland mask or phenology params.
+    allow_failed_tiles : False -> raise at the end if any tile failed (the
+                  province is reported failed and retried by skip_existing;
+                  finished tiles stay in cache_dir). True -> mosaic what
+                  succeeded and leave failed tiles NaN.
     """
-    tiles = generate_tiles(bbox, tile_deg)
-    print(f"  province split into {len(tiles)} tile(s) of {tile_deg} deg")
-    import gc
-    pairs, attrs = [], {}
+    import gc, os, time as _t, traceback
+    tiles = generate_tiles(bbox, tile_deg, geometry=geometry)
+    n_all = len(generate_tiles(bbox, tile_deg)) if geometry is not None else len(tiles)
+    print(f"  province split into {len(tiles)} tile(s) of {tile_deg} deg"
+          + (f" ({n_all - len(tiles)} outside the boundary skipped)" if n_all != len(tiles) else ""))
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    pairs, attrs, failed, n_cached = [], {}, [], 0
     for tb in tqdm(tiles, desc="tiles", unit="tile"):
-        ds_t = build_province_datacube(tb, planting_month, year,
-                                       apply_cropland_mask=apply_cropland_mask)
-        if ds_t is None:
+        cpath = _tile_cache_path(cache_dir, tb, planting_month, year) if cache_dir else None
+        if cpath and os.path.exists(cpath):
+            ds_t = _load_tile(cpath)
+            attrs = dict(ds_t.attrs) or attrs
+            pairs.append((ds_t, tb)); n_cached += 1
             continue
-        attrs = dict(ds_t.attrs)
-        if per_tile_fn is not None:
-            ds_t = per_tile_fn(ds_t)
-        pairs.append((ds_t, tb))
+        for attempt in range(tile_retries + 1):
+            try:
+                ds_t = build_province_datacube(tb, planting_month, year,
+                                               apply_cropland_mask=apply_cropland_mask)
+                if ds_t is not None:
+                    attrs = dict(ds_t.attrs)
+                    if per_tile_fn is not None:
+                        ds_t = per_tile_fn(ds_t)
+                        ds_t.attrs.update({k: v for k, v in attrs.items()
+                                           if k not in ds_t.attrs})
+                    if cpath:
+                        _save_tile(cpath, ds_t)
+                    pairs.append((ds_t, tb))
+                break
+            except Exception as e:
+                if attempt < tile_retries:
+                    print(f"  tile {tuple(round(v, 4) for v in tb)}: "
+                          f"{e.__class__.__name__} — retry {attempt + 1}/{tile_retries}")
+                    _t.sleep(5 * 2 ** attempt)
+                else:
+                    failed.append((tb, repr(e)))
+                    print(f"  tile {tuple(round(v, 4) for v in tb)} FAILED: {e!r}")
+                    traceback.print_exc()
         gc.collect()
+    if n_cached:
+        print(f"  {n_cached} tile(s) reused from cache")
+    if failed and not allow_failed_tiles:
+        raise RuntimeError(
+            f"{len(failed)}/{len(tiles)} tile(s) failed (first: {failed[0][1]})"
+            + ("; finished tiles are cached and will be reused on rerun" if cache_dir else ""))
     ds = _mosaic_tiles(pairs, bbox)
     if ds is not None:
         for k, v in attrs.items():
             ds.attrs.setdefault(k, v)
+        if failed:
+            ds.attrs["failed_tiles"] = len(failed)
     return ds
 
 
