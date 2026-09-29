@@ -19,10 +19,15 @@ Output contract (consumed by phenology.run_phenology):
     ds.attrs['spatial_dims'] = ['y', 'x']
     ds.attrs['window_start'], ds.attrs['window_end']  (ISO dates)
 
-Memory: S2 is read EAGERLY per tile (keeps the SAS token fresh, same reason
-as the RTC loader). With ~40-50 scenes in an 8-month window a 0.1 deg tile
-(~1000 x 1000 px at 0.0001 deg) is ~0.3 GB raw; 0.25 deg tiles are ~2 GB, so
-prefer TILE_DEG = 0.1 on standard Colab.
+Cost: STAC is searched once per province; asset URLs are signed at read
+time (odc.stac.load(patch_url=planetary_computer.sign)). Per tile, the cheap
+WorldCover mask is read first; tiles with no cropland skip S2 entirely and
+S2 is read only over the cropland extent.
+
+Memory: S2 is read eagerly per tile. With ~40-50 scenes in an 8-month window
+a 0.1 deg tile (~1000 x 1000 px at 0.0001 deg) is ~0.3 GB raw; 0.25 deg tiles
+are ~2 GB, so prefer TILE_DEG = 0.1 on standard Colab. Peak memory scales with
+tile_workers.
 ==================================================================
 """
 
@@ -33,8 +38,15 @@ import xarray as xr
 try:                                    # progress bars (Colab/Jupyter-friendly)
     from tqdm.auto import tqdm
 except Exception:
-    def tqdm(iterable=None, *a, **k):
-        return iterable if iterable is not None else []
+    class tqdm:                                         # minimal no-op stand-in
+        def __init__(self, iterable=None, *a, **k):
+            self.iterable = iterable if iterable is not None else []
+        def __iter__(self):
+            return iter(self.iterable)
+        def update(self, n=1):
+            pass
+        def close(self):
+            pass
 
 # ------------------------------------------------------------------
 # Config
@@ -62,10 +74,18 @@ MPC_STAC_URL  = "https://planetarycomputer.microsoft.com/api/stac/v1"
 S2_COLLECTION = "sentinel-2-l2a"
 
 
-def _open_catalog(retries=4):
-    """MPC STAC client with retry/backoff (same as the S1 module)."""
+_CATALOG = None
+
+
+def _open_catalog(retries=4, fresh=False):
+    """MPC STAC client with retry/backoff, reused across calls (fresh=True
+    reopens it). Items come back UNSIGNED: asset URLs are signed at read time
+    via odc.stac.load(patch_url=planetary_computer.sign), which refreshes the
+    SAS token as needed, so one province-wide search stays usable for hours."""
+    global _CATALOG
+    if _CATALOG is not None and not fresh:
+        return _CATALOG
     import time as _t
-    import planetary_computer as pc
     import pystac_client
     from pystac_client.stac_api_io import StacApiIO
     from urllib3 import Retry
@@ -75,14 +95,66 @@ def _open_catalog(retries=4):
     last = None
     for i in range(retries):
         try:
-            return pystac_client.Client.open(
-                MPC_STAC_URL, modifier=pc.sign_inplace,
-                stac_io=StacApiIO(max_retries=retry))
+            _CATALOG = pystac_client.Client.open(
+                MPC_STAC_URL, stac_io=StacApiIO(max_retries=retry))
+            return _CATALOG
         except Exception as e:
             last = e
             if i < retries - 1:
                 _t.sleep(2 ** i)
     raise last
+
+
+def _sign_url(href):
+    """patch_url for odc.stac.load: sign each asset URL when it is read."""
+    import planetary_computer as pc
+    return pc.sign(href)
+
+
+def _search(retries=4, **query):
+    """STAC search -> list of items, retrying errors and empty results
+    (MPC occasionally returns an empty page transiently). [] if still empty."""
+    import time as _t
+    items = []
+    for i in range(retries):
+        try:
+            items = list(_open_catalog(fresh=i > 0).search(**query).items())
+            if items:
+                return items
+        except Exception:
+            if i == retries - 1:
+                raise
+        if i < retries - 1:
+            _t.sleep(2 ** i)
+    return items
+
+
+def search_s2_items(bbox, start_date, end_date, max_cloud=None, retries=4):
+    """Sentinel-2 L2A items over bbox in [start_date, end_date] (unsigned)."""
+    max_cloud = MAX_SCENE_CLOUD if max_cloud is None else max_cloud
+    return _search(retries, collections=[S2_COLLECTION], bbox=list(bbox),
+                   datetime=f"{start_date}/{end_date}",
+                   filter={"op": "<", "args": [{"property": "eo:cloud_cover"}, max_cloud]},
+                   filter_lang="cql2-json")
+
+
+def items_in_bbox(items, bbox):
+    """Items whose footprint intersects bbox — lets one province-wide search
+    serve every tile without another STAC request."""
+    from shapely.geometry import box, shape
+    b = box(*bbox)
+    out = []
+    for it in items:
+        g = getattr(it, "_footprint", None)
+        if g is None:
+            g = shape(it.geometry) if it.geometry else box(*it.bbox)
+            try:
+                it._footprint = g                        # cache on the item
+            except Exception:
+                pass
+        if g.intersects(b) and not g.touches(b):         # shared edge only != overlap
+            out.append(it)
+    return out
 
 
 def _normalize_yx(ds):
@@ -157,48 +229,41 @@ def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time, clear_classes=None):
 # 3. MPC Sentinel-2 L2A loader  (STAC -> xarray -> per-scene NDVI)
 # ==================================================================
 def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
-                       max_cloud=None, pool=8):
+                       max_cloud=None, pool=8, items=None):
     """
     Per-scene NDVI cube (time, y, x) float32 on an EPSG:4326 grid at
     `resolution`, cloud-masked with SCL. None if no scenes.
-    Anonymous MPC access (pc.sign_inplace) — no subscription key.
+    items : pre-searched S2 items (e.g. one province-wide search filtered with
+            items_in_bbox); searched here if None.
+    Anonymous MPC access (URLs signed at read time) — no subscription key.
     """
     import odc.stac
     import time as _t
     from rasterio.errors import RasterioIOError, WarpOperationError
 
     resolution = resolution or GRID_SCALE_DEG
-    max_cloud = MAX_SCENE_CLOUD if max_cloud is None else max_cloud
-
-    def _search():
-        catalog = _open_catalog()                       # fresh signing
-        return catalog.search(
-            collections=[S2_COLLECTION], bbox=list(bbox),
-            datetime=f"{start_date}/{end_date}",
-            query={"eo:cloud_cover": {"lt": max_cloud}},
-        ).item_collection()
+    if items is None:
+        items = search_s2_items(bbox, start_date, end_date, max_cloud)
+    if len(items) == 0:
+        return None
 
     ds = None
     for attempt in range(4):
         try:
-            items = _search()
-            if len(items) == 0:
-                if attempt < 3:
-                    _t.sleep(2 ** attempt); continue
-                return None
             ds = odc.stac.load(
                 items, bands=["B04", "B08", "SCL"], bbox=list(bbox),
                 crs="EPSG:4326", resolution=resolution,
                 groupby="solar_day",                   # fuse same-day granules
                 resampling="nearest",
-                chunks=None,                           # EAGER: token still fresh
+                chunks=None,                           # eager, bounded by the tile size
                 pool=pool,
+                patch_url=_sign_url,                   # fresh SAS token per read
             )
             break
         except (RasterioIOError, WarpOperationError, AssertionError) as e:
             # AssertionError: odc's `src.crs is not None` check fires when a COG
             # read returns a non-georeferenced response (expired SAS / HTTP
-            # error page). A fresh search re-signs every asset URL.
+            # error page). The retry re-signs every asset URL.
             if attempt < 3:
                 print(f"    S2 read retry {attempt+1}/3 ({e.__class__.__name__}) — re-signing")
                 _t.sleep(2 ** attempt); continue
@@ -249,7 +314,7 @@ def composite_to_anchors(da_scene, start_date, end_date,
 
 
 # ==================================================================
-# 5. Cropland mask — ESA WorldCover class 40 from MPC (unchanged)
+# 5. Cropland mask — ESA WorldCover class 40 from MPC
 # ==================================================================
 WORLDCOVER_COLLECTION = "esa-worldcover"
 WORLDCOVER_CROPLAND_CLASS = 40
@@ -263,82 +328,119 @@ def worldcover_items(bbox, retries=4):
     """WorldCover STAC items for bbox, with retry. Raises NoWorldCoverError if
     none come back — WorldCover has no tiles over open sea, so a tile that
     falls entirely offshore lands here and can be skipped."""
-    import time as _t
-    items = []
-    for i in range(retries):
-        items = _open_catalog().search(collections=[WORLDCOVER_COLLECTION],
-                                       bbox=list(bbox)).item_collection()
-        if len(items) > 0:
-            return items
-        if i < retries - 1:
-            _t.sleep(2 ** i)
-    raise NoWorldCoverError(f"ESA WorldCover returned no items for bbox {list(bbox)}")
+    items = _search(retries, collections=[WORLDCOVER_COLLECTION], bbox=list(bbox))
+    if not items:
+        raise NoWorldCoverError(f"ESA WorldCover returned no items for bbox {list(bbox)}")
+    return items
 
 
-def cropland_mask_on_grid(target_da, cropland_class=WORLDCOVER_CROPLAND_CLASS,
-                          items=None):
-    """Boolean (y, x) mask aligned to target_da (True = cropland).
-    `items`: pre-fetched worldcover_items() (searched here if None)."""
+def load_cropland_mask(bbox, items=None, cropland_class=WORLDCOVER_CROPLAND_CLASS):
+    """Boolean (y, x) cropland mask for bbox on the GRID_SCALE_DEG grid.
+    Cheap (one uint8 band, one date) — loaded BEFORE the S2 stack so tiles
+    without cropland never download S2."""
     import odc.stac
-
-    y = target_da["y"].values
-    x = target_da["x"].values
     res = GRID_SCALE_DEG
-    bbox = [float(x.min()) - res / 2, float(y.min()) - res / 2,
-            float(x.max()) + res / 2, float(y.max()) + res / 2]
     if items is None:
         items = worldcover_items(bbox)
-
-    lc = odc.stac.load(items, bands=["map"], bbox=bbox,
-                       crs="EPSG:4326", resolution=res, chunks=None)
+    lc = odc.stac.load(items, bands=["map"], bbox=list(bbox), crs="EPSG:4326",
+                       resolution=res, chunks=None, patch_url=_sign_url)
     lc = _normalize_yx(lc)["map"]
     if "time" in lc.dims:
         lc = lc.isel(time=0, drop=True) if lc.sizes["time"] == 1 \
             else lc.sortby("time").isel(time=-1, drop=True)
-    mask = (lc == cropland_class)
+    return lc == cropland_class
+
+
+def _mask_extent(mask, bbox):
+    """bbox of the True pixels of a (y, x) mask, clipped to bbox."""
+    res = GRID_SCALE_DEG
+    ys = mask["y"].values[mask.any("x").values]
+    xs = mask["x"].values[mask.any("y").values]
+    w, s, e, n = bbox
+    return (max(w, float(xs.min()) - res / 2), max(s, float(ys.min()) - res / 2),
+            min(e, float(xs.max()) + res / 2), min(n, float(ys.max()) + res / 2))
+
+
+def cropland_mask_on_grid(target_da, cropland_class=WORLDCOVER_CROPLAND_CLASS,
+                          items=None, mask=None):
+    """Boolean (y, x) mask aligned to target_da (True = cropland).
+    mask  : a load_cropland_mask() result to reuse (otherwise loaded here)
+    items : pre-fetched worldcover_items() (searched here if None)."""
+    res = GRID_SCALE_DEG
+    if mask is None:
+        y = target_da["y"].values
+        x = target_da["x"].values
+        bbox = [float(x.min()) - res / 2, float(y.min()) - res / 2,
+                float(x.max()) + res / 2, float(y.max()) + res / 2]
+        mask = load_cropland_mask(bbox, items, cropland_class)
     return mask.reindex_like(target_da, method="nearest",
-                             tolerance=res / 2).fillna(False)
+                             tolerance=res / 2).fillna(False).astype(bool)
 
 
 # ==================================================================
 # 6. Glue: one tile/province -> NDVI datacube
 # ==================================================================
-def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True):
+def _fmt_bbox(bbox):
+    return tuple(round(float(v), 4) for v in bbox)
+
+
+def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True,
+                            s2_items=None, wc_items=None):
+    return _build_tile(bbox, planting_month, year, apply_cropland_mask,
+                       s2_items, wc_items)[0]
+
+
+# skip reasons that are fixed properties of the tile (safe to cache)
+_PERMANENT_SKIPS = ("offshore", "no_cropland")
+
+
+def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
+                s2_items=None, wc_items=None):
     """
     bbox : (west, south, east, north) EPSG:4326
+    s2_items / wc_items : optional pre-searched STAC items (e.g. from one
+        province-wide search); filtered to bbox here. Searched if None.
     Returns Dataset {NDVI (time, y, x)} ready for phenology.run_phenology,
-    or None if no S2 coverage for the window, or no WorldCover coverage
-    (tile entirely offshore).
+    or None if the tile has no WorldCover coverage (offshore), no cropland,
+    or no S2 coverage for the window.
+
+    Order matters for cost: the cheap cropland mask is loaded first, tiles
+    without cropland are skipped, and S2 is read only over the cropland extent.
+
+    (_build_tile returns (Dataset | None, skip reason | None).)
     """
     start, end = season_window(planting_month, year)
-    wc_items = None
+    load_bbox, crop = tuple(bbox), None
     if apply_cropland_mask:
-        # cheap STAC search BEFORE the heavy S2 read: offshore tiles have no
-        # WorldCover item, so they are skipped without downloading S2 at all
         try:
-            wc_items = worldcover_items(bbox)
+            wc = worldcover_items(bbox) if wc_items is None else items_in_bbox(wc_items, bbox)
         except NoWorldCoverError:
-            print(f"  no WorldCover coverage for {tuple(round(v, 4) for v in bbox)} "
-                  f"(offshore) — skipping")
-            return None
+            wc = []
+        if not wc:
+            print(f"  no WorldCover coverage for {_fmt_bbox(bbox)} (offshore) — skipping")
+            return None, "offshore"
+        crop = load_cropland_mask(bbox, wc)
+        if not bool(crop.any()):
+            return None, "no_cropland"                      # no cropland: skip S2
+        load_bbox = _mask_extent(crop, bbox)
 
-    scenes = load_s2_ndvi_stack(bbox, start, end)
+    items = None if s2_items is None else items_in_bbox(s2_items, load_bbox)
+    scenes = load_s2_ndvi_stack(load_bbox, start, end, items=items)
     if scenes is None or scenes.sizes.get("time", 0) == 0:
-        print(f"  no S2 L2A coverage for {start}..{end} — skipping")
-        return None
+        print(f"  no S2 L2A coverage for {start}..{end} at {_fmt_bbox(load_bbox)} — skipping")
+        return None, "no_s2"
 
     cube = composite_to_anchors(scenes, start, end)
     del scenes
 
     if apply_cropland_mask:
-        mask = cropland_mask_on_grid(cube.isel(time=0, drop=True), items=wc_items)
-        cube = cube.where(mask)
+        cube = cube.where(cropland_mask_on_grid(cube.isel(time=0, drop=True), mask=crop))
 
     ds = cube.astype("float32").to_dataset(name=NDVI_BAND)
     ds.attrs.update({"spatial_dims": ["y", "x"],
                      "window_start": start, "window_end": end,
                      "interval_days": INTERVAL_DAYS})
-    return ds
+    return ds, None
 
 
 # ==================================================================
@@ -362,7 +464,8 @@ def generate_tiles(bbox, tile_deg=0.1, geometry=None):
         from shapely.ops import unary_union
         from shapely.prepared import prep
         shape = prep(unary_union(_as_geometry_list(geometry)))
-        tiles = [tb for tb in tiles if shape.intersects(box(*tb))]
+        tiles = [tb for tb in tiles
+                 if shape.intersects(box(*tb)) and not shape.touches(box(*tb))]
     return tiles
 
 
@@ -430,10 +533,21 @@ def _save_tile(path, ds):
     os.replace(tmp, path)
 
 
+def _save_skip(path, reason):
+    """Marker for a tile with nothing to process (offshore / no cropland)."""
+    import json, os
+    tmp = path + ".part.npz"
+    np.savez_compressed(tmp, meta=np.array(json.dumps({"skip": reason})))
+    os.replace(tmp, path)
+
+
 def _load_tile(path):
+    """Cached tile Dataset, or None for a skip marker."""
     import json
     with np.load(path, allow_pickle=False) as z:
         meta = json.loads(str(z["meta"]))
+        if "skip" in meta:
+            return None
         coords = {k[len("coord__"):]: z[k] for k in z.files if k.startswith("coord__")}
         data = {k[len("var__"):]: (meta["dims"][k[len("var__"):]], z[k])
                 for k in z.files if k.startswith("var__")}
@@ -445,7 +559,7 @@ def _load_tile(path):
 def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                                   per_tile_fn=None, apply_cropland_mask=True,
                                   geometry=None, tile_retries=2, cache_dir=None,
-                                  allow_failed_tiles=False):
+                                  allow_failed_tiles=False, tile_workers=1):
     """
     Tiled province builder.
 
@@ -454,14 +568,15 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                   fn(ds) -> applied to each tile cube right after it is built
                            (e.g. phenology.run_phenology). Only its (small, 2-D)
                            outputs are kept and mosaicked, so peak memory is one
-                           tile cube. Phenology is per-pixel in time, so tiling
-                           introduces no seams.
+                           tile cube per worker. Phenology is per-pixel in time,
+                           so tiling introduces no seams.
     geometry    : province polygon(s), EPSG:4326. Tiles outside it (open sea
                   inside the bbox) are not processed.
     tile_retries: extra attempts per tile after an error before it counts as failed.
     cache_dir   : if set, each finished tile's output is saved there and reused
                   on the next run, so a failed province resumes instead of
-                  restarting. Tiles with no coverage are not cached.
+                  restarting. Offshore / no-cropland tiles are cached as skip
+                  markers; tiles without S2 coverage are not cached.
                   The cache key is (year, planting month, tile bbox) only — use
                   a separate cache_dir per config/season, or empty it after
                   changing INTERVAL_DAYS, the cropland mask or phenology params.
@@ -469,46 +584,104 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                   province is reported failed and retried by skip_existing;
                   finished tiles stay in cache_dir). True -> mosaic what
                   succeeded and leave failed tiles NaN.
+    tile_workers: tiles processed in parallel threads (reads are I/O bound).
+                  Peak memory scales with it: ~1-1.5 GB per worker at
+                  tile_deg=0.1, so 2-3 is a safe range on standard Colab.
+
+    STAC is searched ONCE per province (S2 + WorldCover); each tile filters
+    those items locally, so a 300-tile province makes 2 searches, not 600.
     """
     import gc, os, time as _t, traceback
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     tiles = generate_tiles(bbox, tile_deg, geometry=geometry)
     n_all = len(generate_tiles(bbox, tile_deg)) if geometry is not None else len(tiles)
     print(f"  province split into {len(tiles)} tile(s) of {tile_deg} deg"
           + (f" ({n_all - len(tiles)} outside the boundary skipped)" if n_all != len(tiles) else ""))
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-    pairs, attrs, failed, n_cached = [], {}, [], 0
-    for tb in tqdm(tiles, desc="tiles", unit="tile"):
-        cpath = _tile_cache_path(cache_dir, tb, planting_month, year) if cache_dir else None
-        if cpath and os.path.exists(cpath):
-            ds_t = _load_tile(cpath)
-            attrs = dict(ds_t.attrs) or attrs
-            pairs.append((ds_t, tb)); n_cached += 1
-            continue
+
+    def cpath(tb):
+        return _tile_cache_path(cache_dir, tb, planting_month, year) if cache_dir else None
+
+    todo = [tb for tb in tiles if not (cache_dir and os.path.exists(cpath(tb)))]
+    s2_items = wc_items = None
+    if todo:
+        # one province-wide search each, over the union of the remaining tiles
+        sb = (min(t[0] for t in todo), min(t[1] for t in todo),
+              max(t[2] for t in todo), max(t[3] for t in todo))
+        start, end = season_window(planting_month, year)
+        s2_items = search_s2_items(sb, start, end)
+        if apply_cropland_mask:
+            # a province is on land, so an empty result here is transient MPC
+            # trouble — let NoWorldCoverError fail the province (retried later)
+            # rather than skipping every tile as "offshore"
+            wc_items = worldcover_items(sb)
+        print(f"  STAC: {len(s2_items)} S2 item(s)"
+              + (f", {len(wc_items)} WorldCover item(s)" if apply_cropland_mask else ""))
+        if not s2_items:
+            # an empty province-wide search is almost certainly transient MPC
+            # trouble (the retry already ran) — fail so skip_existing retries
+            raise RuntimeError(f"no S2 L2A items for province bbox {_fmt_bbox(sb)} "
+                               f"{start}..{end}")
+
+    def run_tile(tb):
+        """-> (tile Dataset | None, error repr | None, from_cache)"""
+        p = cpath(tb)
+        if p and os.path.exists(p):
+            return _load_tile(p), None, True
         for attempt in range(tile_retries + 1):
             try:
-                ds_t = build_province_datacube(tb, planting_month, year,
-                                               apply_cropland_mask=apply_cropland_mask)
+                ds_t, skip = _build_tile(tb, planting_month, year, apply_cropland_mask,
+                                         s2_items=s2_items, wc_items=wc_items)
+                if p and skip in _PERMANENT_SKIPS and wc_items:
+                    _save_skip(p, skip)     # decided from a successful WorldCover search
                 if ds_t is not None:
-                    attrs = dict(ds_t.attrs)
+                    cube_attrs = dict(ds_t.attrs)
                     if per_tile_fn is not None:
                         ds_t = per_tile_fn(ds_t)
-                        ds_t.attrs.update({k: v for k, v in attrs.items()
+                        ds_t.attrs.update({k: v for k, v in cube_attrs.items()
                                            if k not in ds_t.attrs})
-                    if cpath:
-                        _save_tile(cpath, ds_t)
-                    pairs.append((ds_t, tb))
-                break
+                    if p:
+                        _save_tile(p, ds_t)
+                return ds_t, None, False
             except Exception as e:
                 if attempt < tile_retries:
-                    print(f"  tile {tuple(round(v, 4) for v in tb)}: "
-                          f"{e.__class__.__name__} — retry {attempt + 1}/{tile_retries}")
+                    print(f"  tile {_fmt_bbox(tb)}: {e.__class__.__name__} "
+                          f"— retry {attempt + 1}/{tile_retries}")
                     _t.sleep(5 * 2 ** attempt)
                 else:
-                    failed.append((tb, repr(e)))
-                    print(f"  tile {tuple(round(v, 4) for v in tb)} FAILED: {e!r}")
+                    print(f"  tile {_fmt_bbox(tb)} FAILED: {e!r}")
                     traceback.print_exc()
-        gc.collect()
+                    return None, repr(e), False
+            finally:
+                gc.collect()
+
+    pairs, attrs, failed, n_cached = [], {}, [], 0
+
+    def collect(tb, res):
+        nonlocal attrs, n_cached
+        ds_t, err, cached = res
+        n_cached += cached
+        if err is not None:
+            failed.append((tb, err))
+        elif ds_t is not None:
+            attrs = dict(ds_t.attrs) or attrs
+            pairs.append((ds_t, tb))
+
+    bar = tqdm(total=len(tiles), desc="tiles", unit="tile")
+    if tile_workers and tile_workers > 1:
+        with ThreadPoolExecutor(max_workers=tile_workers) as pool:
+            futs = {pool.submit(run_tile, tb): tb for tb in tiles}
+            for f in as_completed(futs):
+                collect(futs[f], f.result())
+                bar.update(1)
+    else:
+        for tb in tiles:
+            collect(tb, run_tile(tb))
+            bar.update(1)
+    bar.close()
+
     if n_cached:
         print(f"  {n_cached} tile(s) reused from cache")
     if failed and not allow_failed_tiles:
