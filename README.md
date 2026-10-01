@@ -1,10 +1,38 @@
 # ai-cropgrowth: rice growth stages from Sentinel-2 NDVI
 
-Maps rice growth stages across Philippine provinces from Sentinel-2 NDVI time
-series. It uses formula-based phenology (thresholds, Savitzky-Golay smoothing
-and NDVI derivatives), so there's no model to train. The output is one
-growth-stage map per month per province, written as Cloud-Optimized GeoTIFFs
-to Google Cloud Storage.
+Maps rice growth stages in the Philippines from Sentinel-2 NDVI time series.
+It uses formula-based phenology (thresholds, Savitzky-Golay smoothing and NDVI
+derivatives), so there's no model to train. Outputs are Cloud-Optimized
+GeoTIFFs on a **30 m** grid by default (10 m optional), written to Google Cloud
+Storage.
+
+## Run modes
+
+| | **Periodic** | **Recent** |
+|---|---|---|
+| Areas | nationwide, regional or provincial (`AREA_LEVEL`) | municipal or barangay (`AOI_PATH`, `AOI_NAMES`) |
+| When | on a schedule: `CADENCE = 'monthly'` or `'semimonthly'` (1st–15th, 16th–end) | on demand (near real time) |
+| Time window | each province's season (planting month −1 … +6), with data up to `AS_OF` | rolling `RECENT_LOOKBACK_DAYS` (240) ending today |
+| Crop cycle | the season's cycle (highest NDVI peak) | the **most recent** cycle (`PEAK_SELECT='last'`) |
+| Output | one stage map per province per period | stage **today** + days since the newest clear observation + hectares per stage |
+| Code | `pipeline.run_periodic_unit`, `pipeline.stage_maps` | `pipeline.run_recent`, `pipeline.stage_area_summary` |
+
+Set `MODE` in the notebook's config cell, then run the **Periodic run** or
+**Recent run** section.
+
+- **Periodic, `PERIODS = 'last_complete'`** (the default): produces the
+  newest period that has ended. A monthly run on 1 March produces February; a
+  semimonthly run on the 16th produces the 1st–15th.
+  - `'current'` produces the period still in progress (provisional).
+  - `'season'` backfills every period of the season that has ended.
+  - Provinces whose season doesn't include the period are reported as
+    `out_of_season`.
+- **Recent**: composites are anchored on the run date, so the newest scenes
+  count.
+  - The run follows the latest crop cycle, so a young crop isn't mistaken for
+    the previous harvested one.
+  - `data_age_days` shows how stale each pixel's stage is. Sentinel-2 revisits
+    every 5 days, but clouds can hide a field for weeks.
 
 ```
 S2 L2A (Microsoft Planetary Computer) → SCL cloud mask → 10-day NDVI composites
@@ -17,30 +45,44 @@ S2 L2A (Microsoft Planetary Computer) → SCL cloud mask → 10-day NDVI composi
 | Path | Role |
 |---|---|
 | `apps/data_processing.py` | Season window, S2 NDVI loading from MPC, compositing, cropland mask, tiling/mosaicking, clipping to the province boundary |
-| `apps/phenology.py` | Per-pixel phenology (transition dates + QC), stage classification, spatial clean-up, COG export |
-| `run_growth_stages.ipynb` | Colab driver: config, GCS auth, a quick-check AOI with plots, and the batch run over all provinces |
+| `apps/phenology.py` | Per-pixel phenology (transition dates + QC), stage classification (date, month or any period), spatial clean-up, COG export |
+| `apps/pipeline.py` | The two run modes: periods, admin-unit selection, periodic and recent runs, area summaries |
+| `run_growth_stages.ipynb` | Colab driver: config, GCS auth, a quick-check AOI with plots, the periodic batch and the recent run |
 
 ## Setup (Google Colab)
 
-1. Put `apps/` on Google Drive and point the `sys.path.insert(...)` line in the
-   notebook's config cell at it.
+1. Put `apps/` (all three `.py` files) on Google Drive and point the
+   `sys.path.insert(...)` line in the notebook's config cell at it.
 2. Run the install cell:
    `pip install pystac-client odc-stac planetary-computer xarray rioxarray scipy geopandas matplotlib google-cloud-storage`.
 3. Authenticate to GCS (the `gcloud auth` + impersonation cells).
-4. Set `YEAR`, `GCS_PREFIX`, `COG_LABEL`, `VECTOR_PATH` and `PLANT_MO_COL` in
-   the config cell.
-5. Run the **Quick check** cells on a small rice area, tune `PHENO_CFG`, then
-   run **Batch Run**.
+4. Set `MODE`, then that mode's settings in the config cell: `AREA_LEVEL`,
+   `CADENCE`, `YEAR`, `VECTOR_PATH`, ... for periodic, or `AOI_PATH`,
+   `AOI_NAME_COL`, `AOI_NAMES` for recent.
+5. Run the **Quick check** cells on a small rice area and tune `PHENO_CFG`.
+   Then run the section for your mode.
 
 Sentinel-2 and WorldCover are read anonymously from Planetary Computer, so no
 API key is needed.
 
 ## Configuration
 
-- **Notebook**: `TILE_DEG` (0.1° keeps one tile ≈ 1000×1000 px in memory),
-  `TILE_WORKERS` (tiles in parallel; ~1–1.5 GB RAM each, 2–3 on standard Colab),
-  `YEAR`, `MONTHS`, `STAGE_METHOD` (`dominant` / `midmonth`),
-  `DATE_MEDIAN_RADIUS`, `SAVE_PHENOLOGY_BANDS`, `TILE_CACHE_DIR`.
+- **Grid**: `RESOLUTION_M = 30` (default) or `10`, applied with
+  `dp.set_resolution()`.
+  - At 30 m, red/NIR are averaged from the 10 m bands, using the COG
+    overviews, so about 9× fewer bytes are read.
+  - The SCL cloud mask and the WorldCover classes take the majority class.
+  - `TILE_DEG` follows the grid: 0.25° at 30 m, 0.1° at 10 m. Either way a tile
+    is about 1000×1000 px in memory.
+- **Notebook**:
+  - `TILE_WORKERS`: tiles in parallel; ~1–1.5 GB RAM each, 2–3 on standard
+    Colab.
+  - `STAGE_METHOD`: `dominant` (stage that fills most of the period) or
+    `midpoint`.
+  - Also `DATE_MEDIAN_RADIUS`, `SAVE_PHENOLOGY_BANDS` and `TILE_CACHE_DIR`.
+- **Admin level**: `select_units` selects provinces. `AREA_LEVEL = 'regional'`
+  needs a region column (`REGION_COL`) in `VECTOR_PATH`; set it to the column
+  your file actually has. Processing and outputs are always per province.
 - **`data_processing` module settings** can be changed from the notebook
   (e.g. `dp.INTERVAL_DAYS = 10`). They are read when each function runs:
   `INTERVAL_DAYS`, `COMPOSITE_METHOD`, `MAX_SCENE_CLOUD`, `GRID_SCALE_DEG`,
@@ -51,8 +93,9 @@ API key is needed.
 
 ## Outputs
 
-- `{COG_LABEL}_{PROVINCE}_{YYYYMM}.tiff`: single-band int16 stage map for each
-  month of the season window (planting month −1 … +6).
+**Periodic**: `{COG_LABEL}_{PROVINCE}_{YYYYMM}.tiff` (monthly) or
+`…_{YYYYMM}H1.tiff` / `…H2.tiff` (semimonthly). Each is a single-band int16
+stage map for one period:
 
   | Value | Stage |
   |---|---|
@@ -64,6 +107,13 @@ API key is needed.
   | 4 | ripening / maturity (peak → harvest) |
   | 5 | harvested / post-harvest |
 
+**Recent**: in `RECENT_PREFIX`:
+- `{AREA}_{YYYYMMDD}.tiff`: 3 int16 bands: `growth_stage` (classes above),
+  `data_age_days` and `qc`.
+- `{AREA}_{YYYYMMDD}_summary.csv`: pixels, hectares and % of mapped cropland
+  per stage.
+
+**QA (optional)**:
 - `qa/{COG_LABEL}_{PROVINCE}_phenology_dates.tiff` (when
   `SAVE_PHENOLOGY_BANDS = True`): 15 int16 bands. They hold 8 transition dates
   (plant, emergence, tillering, panicle_init, heading, peak, maturity, harvest)
@@ -97,9 +147,17 @@ too small, `13` peak NDVI too low, `14` base NDVI too high, `15` no rising
   province's bounding box) are dropped before processing (`geometry=`).
 - **Offshore tiles**: a tile with no WorldCover item is skipped before any
   Sentinel-2 data is downloaded.
-- **Failed image reads**: an `odc` "src.crs is not None" assertion (usually an
-  expired access token) triggers a retry, and every URL is re-signed on that
-  read.
+- **Unreadable Sentinel-2 scenes**: some Planetary Computer files open without
+  a coordinate system. odc then fails with `AssertionError: src.crs is not
+  None`. This isn't covered by `fail_on_error`, and the same scene fails on
+  every retry.
+  - On a failed read, the header of each scene's band files is checked, and
+    the unusable scenes are dropped and logged (`dropping N unreadable S2
+    scene(s): <id> [bands]`).
+  - The tile is then reloaded without them.
+  - Bad scenes are remembered, so later tiles skip them without checking
+    again.
+- **Other read failures** are retried with freshly signed URLs.
 - **Empty province search**: if the province-wide Sentinel-2 search returns
   nothing after its retries, the province is reported as failed rather than
   "no coverage", because that is almost always a temporary Planetary Computer
@@ -110,9 +168,9 @@ too small, `13` peak NDVI too low, `14` base NDVI too high, `15` no rising
   and reused on that rerun, so a large province doesn't start over. Offshore
   and no-cropland tiles are cached as skip markers, so a rerun doesn't
   re-check them.
-  **The cache key is year + planting month + tile bounds only.** Use a new
-  `TILE_CACHE_DIR` (or empty it) after changing `PHENO_CFG` or `dp.*`
-  settings.
+  The cache key covers the time window, grid size, compositing, cloud
+  settings and `PHENO_CFG`. Changing any of them, or running a new period,
+  never reuses stale tiles.
 - To resume the batch after a Colab disconnect, run
   `batch_all(provinces, start_from='PROVINCE')`.
 

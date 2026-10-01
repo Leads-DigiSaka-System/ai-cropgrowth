@@ -31,6 +31,8 @@ tile_workers.
 ==================================================================
 """
 
+import threading
+
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -52,7 +54,9 @@ except Exception:
 # Config
 # ------------------------------------------------------------------
 NDVI_BAND        = "NDVI"
-GRID_SCALE_DEG   = 0.0001        # ~11 m; same grid as the planting-method product
+M_PER_DEG        = 111_320.0     # metres per degree (latitude; longitude at the equator)
+RESOLUTION_M     = 30            # output grid size in metres — change with set_resolution()
+GRID_SCALE_DEG   = RESOLUTION_M / M_PER_DEG   # ~0.00027 deg at 30 m (0.0001 deg ~ 11 m)
 INTERVAL_DAYS    = 10            # composite step (S2 revisit is 5 d; 10 d survives PH cloud)
 COMPOSITE_METHOD = "max"         # 'max' (MVC, suppresses residual cloud) or 'median'
 MAX_SCENE_CLOUD  = 80            # skip S2 items with eo:cloud_cover above this (%)
@@ -69,6 +73,29 @@ SCL_CLEAR_CLASSES = (4, 5, 6)
 S2_OFFSET_DATE = pd.Timestamp("2022-01-25")
 S2_BOA_OFFSET  = 1000
 S2_SCALE       = 10000.0
+
+
+
+def set_resolution(meters):
+    """Set the output grid size (metres; e.g. 30 or 10). Coarser than ~15 m,
+    reflectance is AVERAGED from the 10 m bands (reading the COG overviews, so
+    far fewer bytes) and the SCL / WorldCover classes take the majority class.
+    Returns the grid step in degrees."""
+    global RESOLUTION_M, GRID_SCALE_DEG
+    RESOLUTION_M = float(meters)
+    GRID_SCALE_DEG = RESOLUTION_M / M_PER_DEG
+    return GRID_SCALE_DEG
+
+
+def _coarse():
+    return GRID_SCALE_DEG * M_PER_DEG > 15
+
+
+def _s2_resampling():
+    # SCL by majority, not average: a class code can't be averaged
+    return ({"B04": "average", "B08": "average", "SCL": "mode"} if _coarse()
+            else "nearest")
+
 
 MPC_STAC_URL  = "https://planetarycomputer.microsoft.com/api/stac/v1"
 S2_COLLECTION = "sentinel-2-l2a"
@@ -193,11 +220,17 @@ def season_window(planting_month, year):
 planting_window = season_window          # alias: same name as the S1 module
 
 
-def anchor_dates(start_date, end_date, interval_days=None):
+def anchor_dates(start_date, end_date, interval_days=None, align="start"):
+    """Regular composite dates every interval_days. align='start' anchors on
+    start_date (season products); align='end' anchors on end_date, so the last
+    composite is centred on the newest data (recent / near-real-time products)."""
     interval_days = interval_days or INTERVAL_DAYS
     d0, d1 = pd.Timestamp(start_date), pd.Timestamp(end_date)
     n = int((d1 - d0).days // interval_days) + 1
-    return pd.DatetimeIndex([d0 + pd.Timedelta(days=interval_days * k) for k in range(n)])
+    step = pd.Timedelta(days=interval_days)
+    if align == "end":
+        return pd.DatetimeIndex([d1 - step * k for k in range(n)][::-1])
+    return pd.DatetimeIndex([d0 + step * k for k in range(n)])
 
 
 # ==================================================================
@@ -228,6 +261,51 @@ def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time, clear_classes=None):
 # ==================================================================
 # 3. MPC Sentinel-2 L2A loader  (STAC -> xarray -> per-scene NDVI)
 # ==================================================================
+S2_BANDS = ["B04", "B08", "SCL"]
+
+# Asset hrefs (unsigned) found unreadable or without a CRS / geotransform.
+# Shared across tiles: once a bad scene is found it is dropped everywhere.
+_BAD_HREFS = set()
+_BAD_LOCK = threading.Lock()
+
+
+def _asset_is_bad(href):
+    """Open one COG header and check it is georeferenced. True = unusable."""
+    import rasterio
+    try:
+        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
+            with rasterio.open(_sign_url(href)) as r:
+                return r.crs is None or r.transform.is_identity
+    except Exception:
+        return True
+
+
+def find_bad_s2_assets(items, bands=None, workers=16):
+    """Probe every band of every item (header reads only) and return
+    {item_id: [bad bands]}. Adds the bad hrefs to _BAD_HREFS."""
+    from concurrent.futures import ThreadPoolExecutor
+    bands = bands or S2_BANDS
+    jobs = [(it.id, b, it.assets[b].href) for it in items
+            for b in bands if b in getattr(it, "assets", {})]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        flags = list(ex.map(lambda j: _asset_is_bad(j[2]), jobs))
+    bad = {}
+    for (iid, b, href), f in zip(jobs, flags):
+        if f:
+            bad.setdefault(iid, []).append(b)
+            with _BAD_LOCK:
+                _BAD_HREFS.add(href)
+    return bad
+
+
+def _drop_bad(items, bands=None):
+    bands = bands or S2_BANDS
+    if not _BAD_HREFS:
+        return list(items)
+    return [it for it in items
+            if not any(b in it.assets and it.assets[b].href in _BAD_HREFS for b in bands)]
+
+
 def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
                        max_cloud=None, pool=8, items=None):
     """
@@ -236,38 +314,52 @@ def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
     items : pre-searched S2 items (e.g. one province-wide search filtered with
             items_in_bbox); searched here if None.
     Anonymous MPC access (URLs signed at read time) — no subscription key.
+
+    Bad scenes: some MPC S2 COGs open without a CRS, which odc reports as
+    `AssertionError: src.crs is not None` (not covered by fail_on_error) and
+    which fails on every retry. On a failed read every item's band headers
+    are probed, the unusable scenes are dropped (and remembered for all later
+    tiles), and the load is repeated without them.
     """
     import odc.stac
     import time as _t
-    from rasterio.errors import RasterioIOError, WarpOperationError
+    from rasterio.errors import RasterioError
 
     resolution = resolution or GRID_SCALE_DEG
     if items is None:
         items = search_s2_items(bbox, start_date, end_date, max_cloud)
+    items = _drop_bad(items)
     if len(items) == 0:
         return None
 
-    ds = None
+    ds, probed = None, False
     for attempt in range(4):
         try:
             ds = odc.stac.load(
-                items, bands=["B04", "B08", "SCL"], bbox=list(bbox),
+                items, bands=S2_BANDS, bbox=list(bbox),
                 crs="EPSG:4326", resolution=resolution,
                 groupby="solar_day",                   # fuse same-day granules
-                resampling="nearest",
+                resampling=_s2_resampling(),
                 chunks=None,                           # eager, bounded by the tile size
                 pool=pool,
                 patch_url=_sign_url,                   # fresh SAS token per read
             )
             break
-        except (RasterioIOError, WarpOperationError, AssertionError) as e:
-            # AssertionError: odc's `src.crs is not None` check fires when a COG
-            # read returns a non-georeferenced response (expired SAS / HTTP
-            # error page). The retry re-signs every asset URL.
-            if attempt < 3:
-                print(f"    S2 read retry {attempt+1}/3 ({e.__class__.__name__}) — re-signing")
-                _t.sleep(2 ** attempt); continue
-            raise
+        except (RasterioError, AssertionError) as e:
+            if attempt == 3:
+                raise
+            if not probed:                             # find the scene(s) at fault
+                probed = True
+                bad = find_bad_s2_assets(items)
+                if bad:
+                    print(f"    dropping {len(bad)} unreadable S2 scene(s): "
+                          + ", ".join(f"{k} [{'/'.join(v)}]" for k, v in sorted(bad.items())))
+                    items = _drop_bad(items)
+                    if not items:
+                        return None
+                    continue                           # retry at once without them
+            print(f"    S2 read retry {attempt+1}/3 ({e.__class__.__name__})")
+            _t.sleep(2 ** attempt)
 
     ds = _normalize_yx(ds)
     times = pd.DatetimeIndex(ds["time"].values)
@@ -286,7 +378,7 @@ def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
 # 4. Temporal compositing to regular anchor dates
 # ==================================================================
 def composite_to_anchors(da_scene, start_date, end_date,
-                         interval_days=None, method=None):
+                         interval_days=None, method=None, align="start"):
     """
     Bin scenes into [anchor - dt/2, anchor + dt/2) and reduce with max (MVC)
     or median, ignoring NaN. Empty bins stay NaN — gap filling happens in
@@ -294,7 +386,7 @@ def composite_to_anchors(da_scene, start_date, end_date,
     """
     interval_days = interval_days or INTERVAL_DAYS
     method = method or COMPOSITE_METHOD
-    anchors = anchor_dates(start_date, end_date, interval_days)
+    anchors = anchor_dates(start_date, end_date, interval_days, align)
     half = pd.Timedelta(days=interval_days / 2)
     t = pd.DatetimeIndex(da_scene["time"].values)
     arr = da_scene.values
@@ -343,7 +435,8 @@ def load_cropland_mask(bbox, items=None, cropland_class=WORLDCOVER_CROPLAND_CLAS
     if items is None:
         items = worldcover_items(bbox)
     lc = odc.stac.load(items, bands=["map"], bbox=list(bbox), crs="EPSG:4326",
-                       resolution=res, chunks=None, patch_url=_sign_url)
+                       resolution=res, chunks=None, patch_url=_sign_url,
+                       resampling="mode" if _coarse() else "nearest")
     lc = _normalize_yx(lc)["map"]
     if "time" in lc.dims:
         lc = lc.isel(time=0, drop=True) if lc.sizes["time"] == 1 \
@@ -385,9 +478,9 @@ def _fmt_bbox(bbox):
 
 
 def build_province_datacube(bbox, planting_month, year, apply_cropland_mask=True,
-                            s2_items=None, wc_items=None):
+                            s2_items=None, wc_items=None, window=None, align="start"):
     return _build_tile(bbox, planting_month, year, apply_cropland_mask,
-                       s2_items, wc_items)[0]
+                       s2_items, wc_items, window, align)[0]
 
 
 # skip reasons that are fixed properties of the tile (safe to cache)
@@ -395,11 +488,15 @@ _PERMANENT_SKIPS = ("offshore", "no_cropland")
 
 
 def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
-                s2_items=None, wc_items=None):
+                s2_items=None, wc_items=None, window=None, align="start"):
     """
     bbox : (west, south, east, north) EPSG:4326
     s2_items / wc_items : optional pre-searched STAC items (e.g. from one
         province-wide search); filtered to bbox here. Searched if None.
+    window : (start, end) ISO dates overriding season_window(planting_month,
+        year) — e.g. a season clipped at today, or a rolling recent window.
+        planting_month / year are ignored when it is given.
+    align  : composite anchoring, 'start' (season) or 'end' (recent).
     Returns Dataset {NDVI (time, y, x)} ready for phenology.run_phenology,
     or None if the tile has no WorldCover coverage (offshore), no cropland,
     or no S2 coverage for the window.
@@ -409,7 +506,7 @@ def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
 
     (_build_tile returns (Dataset | None, skip reason | None).)
     """
-    start, end = season_window(planting_month, year)
+    start, end = window or season_window(planting_month, year)
     load_bbox, crop = tuple(bbox), None
     if apply_cropland_mask:
         try:
@@ -430,7 +527,7 @@ def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
         print(f"  no S2 L2A coverage for {start}..{end} at {_fmt_bbox(load_bbox)} — skipping")
         return None, "no_s2"
 
-    cube = composite_to_anchors(scenes, start, end)
+    cube = composite_to_anchors(scenes, start, end, align=align)
     del scenes
 
     if apply_cropland_mask:
@@ -438,8 +535,9 @@ def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
 
     ds = cube.astype("float32").to_dataset(name=NDVI_BAND)
     ds.attrs.update({"spatial_dims": ["y", "x"],
-                     "window_start": start, "window_end": end,
-                     "interval_days": INTERVAL_DAYS})
+                     "window_start": str(start), "window_end": str(end),
+                     "interval_days": INTERVAL_DAYS,
+                     "resolution_m": round(GRID_SCALE_DEG * M_PER_DEG, 2)})
     return ds, None
 
 
@@ -512,11 +610,21 @@ def _mosaic_tiles(pairs, bbox, res=None):
     return ds
 
 
-def _tile_cache_path(cache_dir, tb, planting_month, year):
+def _cache_key(window, align, apply_cropland_mask, cache_tag=""):
+    """Short hash of everything that changes a tile's output, so a cache dir
+    never serves tiles built with other settings (other period end, grid,
+    compositing, phenology parameters passed as cache_tag, ...)."""
+    import hashlib
+    parts = (window, align, apply_cropland_mask, round(GRID_SCALE_DEG, 9),
+             INTERVAL_DAYS, COMPOSITE_METHOD, MAX_SCENE_CLOUD,
+             tuple(SCL_CLEAR_CLASSES), str(cache_tag))
+    return hashlib.md5(repr(parts).encode()).hexdigest()[:10]
+
+
+def _tile_cache_path(cache_dir, tb, key):
     import os
     w, s, e, n = tb
-    return os.path.join(cache_dir, f"tile_{year}_{planting_month:02d}_"
-                                   f"{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}.npz")
+    return os.path.join(cache_dir, f"tile_{key}_{w:.4f}_{s:.4f}_{e:.4f}_{n:.4f}.npz")
 
 
 def _save_tile(path, ds):
@@ -559,7 +667,8 @@ def _load_tile(path):
 def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                                   per_tile_fn=None, apply_cropland_mask=True,
                                   geometry=None, tile_retries=2, cache_dir=None,
-                                  allow_failed_tiles=False, tile_workers=1):
+                                  allow_failed_tiles=False, tile_workers=1,
+                                  window=None, align="start", cache_tag=""):
     """
     Tiled province builder.
 
@@ -577,13 +686,15 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                   on the next run, so a failed province resumes instead of
                   restarting. Offshore / no-cropland tiles are cached as skip
                   markers; tiles without S2 coverage are not cached.
-                  The cache key is (year, planting month, tile bbox) only — use
-                  a separate cache_dir per config/season, or empty it after
-                  changing INTERVAL_DAYS, the cropland mask or phenology params.
+                  The cache key covers the window, grid, compositing and
+                  cropland settings; pass the phenology parameters as
+                  `cache_tag` (e.g. repr(PHENO_CFG)) so changing them also
+                  invalidates the cache.
     allow_failed_tiles : False -> raise at the end if any tile failed (the
                   province is reported failed and retried by skip_existing;
                   finished tiles stay in cache_dir). True -> mosaic what
                   succeeded and leave failed tiles NaN.
+    window / align : see build_province_datacube.
     tile_workers: tiles processed in parallel threads (reads are I/O bound).
                   Peak memory scales with it: ~1-1.5 GB per worker at
                   tile_deg=0.1, so 2-3 is a safe range on standard Colab.
@@ -601,8 +712,11 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
 
+    window = tuple(str(d) for d in (window or season_window(planting_month, year)))
+    key = _cache_key(window, align, apply_cropland_mask, cache_tag)
+
     def cpath(tb):
-        return _tile_cache_path(cache_dir, tb, planting_month, year) if cache_dir else None
+        return _tile_cache_path(cache_dir, tb, key) if cache_dir else None
 
     todo = [tb for tb in tiles if not (cache_dir and os.path.exists(cpath(tb)))]
     s2_items = wc_items = None
@@ -610,7 +724,7 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
         # one province-wide search each, over the union of the remaining tiles
         sb = (min(t[0] for t in todo), min(t[1] for t in todo),
               max(t[2] for t in todo), max(t[3] for t in todo))
-        start, end = season_window(planting_month, year)
+        start, end = window
         s2_items = search_s2_items(sb, start, end)
         if apply_cropland_mask:
             # a province is on land, so an empty result here is transient MPC
@@ -633,7 +747,8 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
         for attempt in range(tile_retries + 1):
             try:
                 ds_t, skip = _build_tile(tb, planting_month, year, apply_cropland_mask,
-                                         s2_items=s2_items, wc_items=wc_items)
+                                         s2_items=s2_items, wc_items=wc_items,
+                                         window=window, align=align)
                 if p and skip in _PERMANENT_SKIPS and wc_items:
                     _save_skip(p, skip)     # decided from a successful WorldCover search
                 if ds_t is not None:

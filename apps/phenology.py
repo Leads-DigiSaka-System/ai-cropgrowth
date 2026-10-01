@@ -95,6 +95,12 @@ DEFAULTS = dict(
     SG_WINDOW           = 5,          # SG window in composites (5 x 10 d = 50 d)
     SG_POLYORDER        = 2,
     PEAK_SEARCH_DAYS    = (45, 210),  # peak allowed this many days after window start
+    PEAK_SELECT         = "max",      # 'max': highest NDVI_s in the search range (one
+                                      #   season per window — season products)
+                                      # 'last': most recent cycle — the latest local max
+                                      #   (or a still-rising end) that rises >= MIN_AMPLITUDE
+                                      #   above its pre-peak trough; for rolling windows
+                                      #   that can hold two crops (recent products)
     PRE_PEAK_MAX_DAYS   = 110,        # trough search: at most this far before the peak
     POST_PEAK_MAX_DAYS  = 90,         # trough search: at most this far after the peak
     MIN_OBS             = 6,          # min clear composites in the window
@@ -249,6 +255,30 @@ def _crossing_time(S, a_idx, thr, t, dt):
     return t[np.clip(a_idx, 0, len(t) - 1)] + frac * dt
 
 
+def _last_cycle_peak(S, ip_max, p_lo, p_hi, first_obs, last_obs, pre_steps, min_amp):
+    """Index of the most recent cycle's peak per pixel: the latest local
+    maximum in [p_lo, p_hi] (or the last observation if NDVI is still rising
+    there) whose rise above the minimum of the preceding pre_steps composites
+    is >= min_amp. Falls back to ip_max where no candidate qualifies."""
+    T, N = S.shape
+    idx = np.arange(T)[:, None]
+    prev = np.vstack([np.full((1, N), -np.inf), S[:-1]])
+    nxt = np.vstack([S[1:], np.full((1, N), np.inf)])
+    local_max = (S >= prev) & (S > nxt)
+    rising_end = (idx == last_obs[None, :]) & (S > prev)
+    cand = (local_max | rising_end) & (idx >= p_lo[None, :]) & (idx <= p_hi[None, :])
+    # minimum over the pre_steps composites before each index (not before first_obs)
+    left_min = np.full_like(S, np.inf)
+    for k in range(1, pre_steps + 1):
+        sh = np.vstack([np.full((k, N), np.inf), S[:-k]])
+        sh = np.where(idx - k >= first_obs[None, :], sh, np.inf)
+        left_min = np.minimum(left_min, sh)
+    cand &= (S - left_min) >= min_amp
+    has = cand.any(0)
+    last = T - 1 - np.argmax(cand[::-1], axis=0)
+    return np.where(has, last, ip_max)
+
+
 # ==================================================================
 # Core: phenology for a batch of pixel time series
 # ==================================================================
@@ -266,7 +296,7 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     idx = np.arange(T)[:, None]
     nan = np.full(N, np.nan, np.float32)
     out = {k: nan.copy() for k in DATE_BANDS + [
-        "season_length", "ndvi_min", "ndvi_max", "ndvi15", "max_gap_days"]}
+        "season_length", "ndvi_min", "ndvi_max", "ndvi15", "max_gap_days", "last_obs"]}
 
     obs = np.isfinite(X)
     n_obs = obs.sum(0)
@@ -286,6 +316,8 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     prev_shift = np.vstack([np.full((1, N), -1), prev[:-1]])
     gaps = np.where(obs & (prev_shift >= 0), idx - prev_shift, 0)
     out["max_gap_days"] = np.where(ok, gaps.max(0) * dt, np.nan).astype(np.float32)
+    # date of the newest clear composite (epoch days): how fresh a stage is
+    out["last_obs"] = np.where(obs.any(0), t[last_obs], np.nan).astype(np.float32)
 
     # ---- clean + smooth -------------------------------------------------
     F, S = _clean_and_smooth(X, c, ok)
@@ -301,6 +333,9 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     p_hi = np.minimum(p_hi, last_obs)
     has_range = p_hi >= p_lo
     ip = _masked_argmax(S, _range_mask(T, p_lo, p_hi))
+    if c["PEAK_SELECT"] == "last":
+        ip = _last_cycle_peak(S, ip, p_lo, p_hi, first_obs, last_obs,
+                              int(round(c["PRE_PEAK_MAX_DAYS"] / dt)), c["MIN_AMPLITUDE"])
     s_ip = _take(S, ip)
     left_ok = (ip - 1 >= first_obs) & (_take(S, ip - 1) <= s_ip)
     right_ok = (ip + 1 <= last_obs) & (_take(S, ip + 1) <= s_ip)
@@ -477,7 +512,7 @@ def run_phenology(ds, batch_size=None, **overrides):
 
     any_obs = np.isfinite(X).any(0)
     names = DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max", "ndvi15",
-                          "n_obs", "max_gap_days", "qc"]
+                          "n_obs", "max_gap_days", "last_obs", "qc"]
     flat = {n: np.full(ny * nx, np.nan, np.float32) for n in names}
     cols = np.where(any_obs)[0]
     for s in range(0, cols.size, batch_size):
@@ -527,21 +562,21 @@ def classify_stage(ds, as_of):
     return out
 
 
-def classify_stage_month(ds, month, method="dominant"):
+def classify_stage_period(ds, start, end, method="dominant"):
     """
-    ONE growth-stage value per pixel for a calendar month (e.g. '2026-02').
+    ONE growth-stage value per pixel for the period [start, end) — a month,
+    a half-month, or any span.
 
     method : 'dominant' -> the stage the crop spends the most days in during
-                           that month (computed exactly from interval overlaps)
-             'midmonth' -> the stage on the 15th
+                           the period (computed exactly from interval overlaps)
+             'midpoint' -> the stage on the middle day of the period
     Returns int16 (y, x): 0..5 per STAGE_CLASSES, -1 = nodata.
     """
-    m0 = pd.Timestamp(f"{month}-01")
-    m1 = m0 + pd.offsets.MonthBegin(1)
-    if method == "midmonth":
-        out = classify_stage(ds, m0 + pd.Timedelta(days=14))
+    p0, p1 = pd.Timestamp(start), pd.Timestamp(end)
+    if method in ("midpoint", "midmonth"):
+        out = classify_stage(ds, p0 + (p1 - p0) / 2)
     else:
-        a, b = to_epoch_days(m0)[0], to_epoch_days(m1)[0]
+        a, b = to_epoch_days(p0)[0], to_epoch_days(p1)[0]
         qc = ds["qc"].values
         # stage k lasts from its start date to the next stage's start date
         starts = [np.full(qc.shape, -np.inf)] + [
@@ -563,9 +598,24 @@ def classify_stage_month(ds, month, method="dominant"):
         stage[rice] = np.array(codes, np.int16)[pick][rice]
         out = xr.DataArray(stage, dims=ds["qc"].dims, coords=ds["qc"].coords,
                            name="growth_stage")
-    out.attrs.update({"as_of": m0.strftime("%Y-%m"), "method": method,
+    out.attrs.update({"as_of": str(p0.date()), "period_end": str(p1.date()),
+                      "method": method,
                       "classes": "; ".join(f"{k}={v}" for k, v in STAGE_CLASSES.items()),
                       "nodata": STAGE_NODATA})
+    return out
+
+
+def classify_stage_month(ds, month, method="dominant"):
+    """classify_stage_period for a calendar month 'YYYY-MM' ('midmonth' =
+    stage on the 15th)."""
+    m0 = pd.Timestamp(f"{month}-01")
+    m1 = m0 + pd.offsets.MonthBegin(1)
+    if method == "midmonth":
+        out = classify_stage(ds, m0 + pd.Timedelta(days=14))
+        out.attrs["method"] = method
+    else:
+        out = classify_stage_period(ds, m0, m1, method)
+    out.attrs["as_of"] = m0.strftime("%Y-%m")
     return out
 
 
@@ -725,6 +775,63 @@ def write_stage_cog(stage_da, path):
         dst.set_band_description(1, f"growth_stage {da.attrs.get('as_of')}")
         dst.update_tags(as_of=da.attrs.get("as_of"), classes=da.attrs.get("classes"),
                         method=da.attrs.get("method", "date"))
+    rio_copy(tmp, path, driver="COG", compress="DEFLATE", blocksize=512,
+             overview_resampling="nearest")
+    os.remove(tmp)
+    return path
+
+
+def recent_stage(ds, as_of):
+    """
+    Near-real-time product for a rolling-window phenology run: Dataset with
+      growth_stage   stage on `as_of` (classify_stage)
+      data_age_days  as_of - date of the newest clear composite (how fresh
+                     the stage is; large values = long cloud gap)
+      qc             phenology QC code
+    """
+    st = classify_stage(ds, as_of)
+    t = to_epoch_days(as_of)[0]
+    age = np.where(np.isfinite(ds["last_obs"].values), t - ds["last_obs"].values, np.nan)
+    out = xr.Dataset({"growth_stage": st,
+                      "data_age_days": (st.dims, age.astype(np.float32)),
+                      "qc": ds["qc"]})
+    out.attrs.update(ds.attrs)
+    out.attrs["as_of"] = str(pd.Timestamp(as_of).date())
+    return out
+
+
+def write_recent_cog(rec, path):
+    """3-band int16 COG of recent_stage(): growth_stage, data_age_days, qc
+    (nodata -32768; growth_stage keeps -1 = non-crop as in the stage maps)."""
+    import os, tempfile
+    import rasterio
+    from rasterio.shutil import copy as rio_copy
+    from rasterio.transform import from_origin
+
+    if rec["y"].values[0] < rec["y"].values[-1]:
+        rec = rec.sortby("y", ascending=False)
+    ys, xs = rec["y"].values, rec["x"].values
+    rx, ry = float(abs(xs[1] - xs[0])), float(abs(ys[1] - ys[0]))
+    nodata = -32768
+    bands = ["growth_stage", "data_age_days", "qc"]
+    data = np.empty((3, ys.size, xs.size), np.int16)
+    for i, b in enumerate(bands):
+        v = rec[b].values.astype(np.float64)
+        data[i] = np.where(np.isfinite(v), np.clip(np.round(v), -32767, 32767),
+                           nodata).astype(np.int16)
+    profile = dict(driver="GTiff", width=xs.size, height=ys.size, count=3,
+                   dtype="int16", crs="EPSG:4326",
+                   transform=from_origin(xs[0] - rx / 2, ys[0] + ry / 2, rx, ry),
+                   nodata=nodata, tiled=True, blockxsize=512, blockysize=512)
+    tmp = os.path.join(tempfile.gettempdir(), "_plain_" + os.path.basename(path))
+    with rasterio.open(tmp, "w", **profile) as dst:
+        dst.write(data)
+        for i, b in enumerate(bands, 1):
+            dst.set_band_description(i, b)
+        dst.update_tags(as_of=rec.attrs.get("as_of"),
+                        classes="; ".join(f"{k}={v}" for k, v in STAGE_CLASSES.items()),
+                        qc_codes="; ".join(f"{k}={v}" for k, v in QC_DESCRIPTION.items()),
+                        window=f"{rec.attrs.get('window_start')}..{rec.attrs.get('window_end')}")
     rio_copy(tmp, path, driver="COG", compress="DEFLATE", blocksize=512,
              overview_resampling="nearest")
     os.remove(tmp)
