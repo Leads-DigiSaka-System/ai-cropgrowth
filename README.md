@@ -6,6 +6,32 @@ derivatives), so there's no model to train. Outputs are Cloud-Optimized
 GeoTIFFs on a **30 m** grid by default (10 m optional), written to Google Cloud
 Storage.
 
+## Data sources
+
+Set `DATA_SOURCE` in the notebook (`dp.set_data_source`).
+
+| | **`'hls'`**: Harmonized Landsat Sentinel-2 v2.0 | **`'s2'`**: Sentinel-2 L2A |
+|---|---|---|
+| Sensors | Landsat 8/9 (`hls2-l30`) + Sentinel-2 (`hls2-s30`) | Sentinel-2 |
+| Revisit | ~2–3 days combined | 5 days |
+| Native resolution | 30 m | 10 m (red/NIR) |
+| Cloud mask | Fmask: drops cirrus, cloud, adjacent cloud, shadow, snow and high aerosol; keeps water (flooded paddies) | SCL classes 4/5/6 |
+| Calibration | Landsat and Sentinel-2 brought to one spectral response and BRDF-normalised | ESA processing-baseline offset removed |
+| NIR band | B8A (S30) / B05 (L30) | B08 |
+
+- **HLS** gives more clear observations in cloudy seasons, which is the main
+  limit for rice phenology in the Philippines. It is the default in the
+  notebook, on the 30 m grid.
+- **S2** is the choice for a 10 m grid. It may also be a few days fresher in
+  recent mode, because HLS is produced by NASA after the source scenes arrive.
+- **Re-check thresholds when switching sources.** HLS NDVI uses the narrow NIR
+  band, so absolute values differ a little from S2. Confirm `MIN_PEAK_NDVI` and
+  `MAX_BASE_NDVI` with the quick check.
+- **Searches**: Planetary Computer accepts only one collection per search, so
+  HLS makes two searches (L30, S30) and merges them. The two sensors are loaded
+  separately because their NIR bands have different names, then combined in
+  time.
+
 ## Run modes
 
 | | **Periodic** | **Recent** |
@@ -35,7 +61,7 @@ Set `MODE` in the notebook's config cell, then run the **Periodic run** or
     every 5 days, but clouds can hide a field for weeks.
 
 ```
-S2 L2A (Microsoft Planetary Computer) → SCL cloud mask → 10-day NDVI composites
+HLS v2 or S2 L2A (Microsoft Planetary Computer) → Fmask / SCL cloud mask → 10-day NDVI composites
 → ESA WorldCover cropland mask → SG smoothing → 15 % amplitude threshold
 → NDVI derivatives / peaks → transition dates → monthly stage maps
 ```

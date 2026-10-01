@@ -1,8 +1,13 @@
 """
-data_processing.py  (Sentinel-2 NDVI version — rice growth stages)
+data_processing.py  (optical NDVI version — rice growth stages)
 ==================================================================
 Same role as the planting-method data_processing.py, but the datacube is
-Sentinel-2 L2A NDVI instead of Sentinel-1 VH.
+optical NDVI instead of Sentinel-1 VH. Two sources (DATA_SOURCE /
+set_data_source):
+  * 's2'  Sentinel-2 L2A (MPC `sentinel-2-l2a`), SCL cloud mask — details below
+  * 'hls' Harmonized Landsat Sentinel-2 v2.0 (MPC `hls2-l30` + `hls2-s30`):
+          Landsat 8/9 + Sentinel-2 at 30 m on one calibration, Fmask cloud
+          mask, ~2-3 day combined revisit
 
   * S2 L2A (B04, B08, SCL) -> Microsoft Planetary Computer `sentinel-2-l2a`
                               (STAC/COG, anonymous SAS signing, no GEE quota)
@@ -100,6 +105,40 @@ def _s2_resampling():
 MPC_STAC_URL  = "https://planetarycomputer.microsoft.com/api/stac/v1"
 S2_COLLECTION = "sentinel-2-l2a"
 
+# ------------------------------------------------------------------
+# Data source
+#   's2'  : Sentinel-2 L2A (10 m bands; SCL cloud mask)
+#   'hls' : Harmonized Landsat Sentinel-2 v2.0 — Landsat 8/9 (L30) + Sentinel-2
+#           (S30) at 30 m, cross-calibrated (same spectral response, BRDF
+#           normalised), Fmask cloud mask. ~2-3 day combined revisit vs 5 d,
+#           so more clear looks through cloud. Native 30 m: use with the 30 m grid.
+# ------------------------------------------------------------------
+DATA_SOURCE = "s2"
+HLS_COLLECTIONS = ("hls2-s30", "hls2-l30")      # MPC allows ONE collection per search
+# asset keys tried in order (red, NIR, QA); S30 NIR = B8A (narrow NIR, the band
+# harmonised to Landsat), L30 NIR = B05
+HLS_BAND_CANDIDATES = {
+    "hls2-s30": (("B04", "red"), ("B8A", "nir08", "nir"), ("Fmask", "fmask")),
+    "hls2-l30": (("B04", "red"), ("B05", "nir08", "nir"), ("Fmask", "fmask")),
+}
+HLS_SCALE = 10000.0
+HLS_FILL = -9999                 # reflectance fill
+HLS_FMASK_FILL = 255
+# Fmask bits that make an observation unusable: 0 cirrus, 1 cloud,
+# 2 adjacent to cloud/shadow, 3 cloud shadow, 4 snow/ice.
+# Bit 5 (water) is KEPT — flooded paddies at planting.
+HLS_FMASK_BAD_BITS = (0, 1, 2, 3, 4)
+HLS_MASK_HIGH_AEROSOL = True     # also drop bits 6-7 == 11 (high aerosol)
+
+
+def set_data_source(source):
+    """'s2' or 'hls'."""
+    global DATA_SOURCE
+    if source not in ("s2", "hls"):
+        raise ValueError("source must be 's2' or 'hls'")
+    DATA_SOURCE = source
+    return DATA_SOURCE
+
 
 _CATALOG = None
 
@@ -163,6 +202,26 @@ def search_s2_items(bbox, start_date, end_date, max_cloud=None, retries=4):
                    datetime=f"{start_date}/{end_date}",
                    filter={"op": "<", "args": [{"property": "eo:cloud_cover"}, max_cloud]},
                    filter_lang="cql2-json")
+
+
+def search_hls_items(bbox, start_date, end_date, max_cloud=None, retries=4):
+    """HLS v2 L30 + S30 items (unsigned). One search per collection — MPC
+    rejects multi-collection searches — merged into one list."""
+    max_cloud = MAX_SCENE_CLOUD if max_cloud is None else max_cloud
+    items = []
+    for coll in HLS_COLLECTIONS:
+        items += _search(retries, collections=[coll], bbox=list(bbox),
+                         datetime=f"{start_date}/{end_date}",
+                         filter={"op": "<", "args": [{"property": "eo:cloud_cover"}, max_cloud]},
+                         filter_lang="cql2-json")
+    return items
+
+
+def search_optical_items(bbox, start_date, end_date, max_cloud=None, source=None):
+    """Items of the active DATA_SOURCE ('s2' or 'hls')."""
+    source = source or DATA_SOURCE
+    fn = search_hls_items if source == "hls" else search_s2_items
+    return fn(bbox, start_date, end_date, max_cloud)
 
 
 def items_in_bbox(items, bbox):
@@ -258,6 +317,44 @@ def ndvi_from_l2a(red_dn, nir_dn, scl, acq_time, clear_classes=None):
     return ndvi.astype(np.float32)
 
 
+def ndvi_from_hls(red, nir, fmask):
+    """
+    red, nir : int16 HLS surface reflectance x 10000 (fill -9999)
+    fmask    : uint8 Fmask bit field (fill 255)
+    Returns float32 NDVI with NaN for fill / cloud / shadow / snow / (high aerosol).
+    No BOA offset: HLS is already harmonised across sensors and years.
+    """
+    red = np.asarray(red, dtype=np.float32)
+    nir = np.asarray(nir, dtype=np.float32)
+    fm = np.asarray(fmask).astype(np.uint16)
+    bad_bits = sum(1 << b for b in HLS_FMASK_BAD_BITS)
+    valid = (red != HLS_FILL) & (nir != HLS_FILL) & (fm != HLS_FMASK_FILL) & ((fm & bad_bits) == 0)
+    if HLS_MASK_HIGH_AEROSOL:
+        valid &= ((fm >> 6) & 3) != 3
+    red = np.clip(red / HLS_SCALE, 1e-4, None)          # negative SR over water -> tiny +
+    nir = np.clip(nir / HLS_SCALE, 1e-4, None)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndvi = (nir - red) / (nir + red)
+    ndvi = np.where(valid & np.isfinite(ndvi), np.clip(ndvi, -1.0, 1.0), np.nan)
+    return ndvi.astype(np.float32)
+
+
+def _hls_band_keys(item):
+    """(red, nir, qa) asset keys for an HLS item, by collection."""
+    coll = getattr(item, "collection_id", None) or ""
+    cands = HLS_BAND_CANDIDATES.get(coll)
+    if cands is None:
+        raise KeyError(f"unknown HLS collection {coll!r} for item {item.id}")
+    keys = []
+    for options in cands:
+        k = next((o for o in options if o in item.assets), None)
+        if k is None:
+            raise KeyError(f"{item.id}: none of {options} in assets {sorted(item.assets)} "
+                           f"— update HLS_BAND_CANDIDATES")
+        keys.append(k)
+    return keys
+
+
 # ==================================================================
 # 3. MPC Sentinel-2 L2A loader  (STAC -> xarray -> per-scene NDVI)
 # ==================================================================
@@ -306,72 +403,127 @@ def _drop_bad(items, bands=None):
             if not any(b in it.assets and it.assets[b].href in _BAD_HREFS for b in bands)]
 
 
-def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
-                       max_cloud=None, pool=8, items=None):
-    """
-    Per-scene NDVI cube (time, y, x) float32 on an EPSG:4326 grid at
-    `resolution`, cloud-masked with SCL. None if no scenes.
-    items : pre-searched S2 items (e.g. one province-wide search filtered with
-            items_in_bbox); searched here if None.
-    Anonymous MPC access (URLs signed at read time) — no subscription key.
+def _hls_resampling():
+    # HLS is natively 30 m: nearest at ~30 m, aggregate when coarser
+    if GRID_SCALE_DEG * M_PER_DEG > 45:
+        return {"red": "average", "nir": "average", "qa": "mode"}
+    return {"red": "nearest", "nir": "nearest", "qa": "nearest"}
 
-    Bad scenes: some MPC S2 COGs open without a CRS, which odc reports as
-    `AssertionError: src.crs is not None` (not covered by fail_on_error) and
-    which fails on every retry. On a failed read every item's band headers
-    are probed, the unusable scenes are dropped (and remembered for all later
-    tiles), and the load is repeated without them.
-    """
+
+def _odc_load(items, bands, bbox, resolution, resampling, pool):
+    """odc.stac.load with retry and bad-scene handling (see load_ndvi_stack).
+    Returns (Dataset | None if every item turned out unusable)."""
     import odc.stac
     import time as _t
     from rasterio.errors import RasterioError
 
-    resolution = resolution or GRID_SCALE_DEG
-    if items is None:
-        items = search_s2_items(bbox, start_date, end_date, max_cloud)
-    items = _drop_bad(items)
-    if len(items) == 0:
+    items = _drop_bad(items, bands)
+    if not items:
         return None
-
-    ds, probed = None, False
+    probed = False
     for attempt in range(4):
         try:
-            ds = odc.stac.load(
-                items, bands=S2_BANDS, bbox=list(bbox),
+            return odc.stac.load(
+                items, bands=list(bands), bbox=list(bbox),
                 crs="EPSG:4326", resolution=resolution,
                 groupby="solar_day",                   # fuse same-day granules
-                resampling=_s2_resampling(),
+                resampling=resampling,
                 chunks=None,                           # eager, bounded by the tile size
                 pool=pool,
                 patch_url=_sign_url,                   # fresh SAS token per read
             )
-            break
         except (RasterioError, AssertionError) as e:
             if attempt == 3:
                 raise
             if not probed:                             # find the scene(s) at fault
                 probed = True
-                bad = find_bad_s2_assets(items)
+                bad = find_bad_s2_assets(items, bands)
                 if bad:
-                    print(f"    dropping {len(bad)} unreadable S2 scene(s): "
+                    print(f"    dropping {len(bad)} unreadable scene(s): "
                           + ", ".join(f"{k} [{'/'.join(v)}]" for k, v in sorted(bad.items())))
-                    items = _drop_bad(items)
+                    items = _drop_bad(items, bands)
                     if not items:
                         return None
                     continue                           # retry at once without them
-            print(f"    S2 read retry {attempt+1}/3 ({e.__class__.__name__})")
+            print(f"    read retry {attempt+1}/3 ({e.__class__.__name__})")
             _t.sleep(2 ** attempt)
 
+
+def _to_ndvi_cube(ds, fn, red, nir, qa):
     ds = _normalize_yx(ds)
     times = pd.DatetimeIndex(ds["time"].values)
     ndvi = np.empty((len(times), ds.sizes["y"], ds.sizes["x"]), np.float32)
     for k, t in enumerate(times):
-        ndvi[k] = ndvi_from_l2a(ds["B04"].values[k], ds["B08"].values[k],
-                                ds["SCL"].values[k], t)
-    out = xr.DataArray(ndvi, dims=("time", "y", "x"),
-                       coords={"time": times, "y": ds["y"].values, "x": ds["x"].values},
-                       name=NDVI_BAND)
-    del ds
+        ndvi[k] = fn(ds[red].values[k], ds[nir].values[k], ds[qa].values[k], t)
+    return xr.DataArray(ndvi, dims=("time", "y", "x"),
+                        coords={"time": times, "y": ds["y"].values, "x": ds["x"].values},
+                        name=NDVI_BAND)
+
+
+def load_ndvi_stack(bbox, start_date, end_date, resolution=None, max_cloud=None,
+                    pool=8, items=None, source=None):
+    """
+    Per-scene NDVI cube (time, y, x) float32 on an EPSG:4326 grid at
+    `resolution`, cloud-masked. None if no scenes.
+    source : 's2' (Sentinel-2 L2A, SCL mask) or 'hls' (HLS v2 L30 + S30,
+             Fmask); default DATA_SOURCE.
+    items  : pre-searched items of that source (e.g. one province-wide
+             search filtered with items_in_bbox); searched here if None.
+    Anonymous MPC access (URLs signed at read time) — no subscription key.
+
+    Bad scenes: some MPC COGs open without a CRS, which odc reports as
+    `AssertionError: src.crs is not None` (not covered by fail_on_error) and
+    which fails on every retry. On a failed read every item's band headers
+    are probed, the unusable scenes are dropped (and remembered for all later
+    tiles), and the load is repeated without them.
+    """
+    source = source or DATA_SOURCE
+    resolution = resolution or GRID_SCALE_DEG
+    if items is None:
+        items = search_optical_items(bbox, start_date, end_date, max_cloud, source)
+    if len(items) == 0:
+        return None
+
+    if source != "hls":
+        ds = _odc_load(items, S2_BANDS, bbox, resolution, _s2_resampling(), pool)
+        if ds is None:
+            return None
+        out = _to_ndvi_cube(ds, ndvi_from_l2a, "B04", "B08", "SCL")
+        del ds
+        return out
+
+    # HLS: L30 and S30 name the NIR band differently -> load each sensor
+    # (collection / band-key group) separately on the same grid, then merge
+    groups = {}
+    for it in items:
+        groups.setdefault(tuple(_hls_band_keys(it)), []).append(it)
+    rs = _hls_resampling()
+    cubes = []
+    for (red, nir, qa), grp in groups.items():
+        ds = _odc_load(grp, (red, nir, qa), bbox, resolution,
+                       {red: rs["red"], nir: rs["nir"], qa: rs["qa"]}, pool)
+        if ds is not None:
+            cubes.append(_to_ndvi_cube(ds, lambda r, n, q, t: ndvi_from_hls(r, n, q),
+                                       red, nir, qa))
+        del ds
+    if not cubes:
+        return None
+    if len(cubes) == 1:
+        return cubes[0]
+    # same bbox + resolution -> same grid; guard against float jitter anyway
+    ref = cubes[0]
+    cubes = [ref] + [c.reindex(y=ref.y, x=ref.x, method="nearest",
+                               tolerance=resolution / 2) for c in cubes[1:]]
+    out = xr.concat(cubes, dim="time").sortby("time")
+    out.name = NDVI_BAND
     return out
+
+
+def load_s2_ndvi_stack(bbox, start_date, end_date, resolution=None,
+                       max_cloud=None, pool=8, items=None):
+    """Sentinel-2 L2A NDVI cube (load_ndvi_stack with source='s2')."""
+    return load_ndvi_stack(bbox, start_date, end_date, resolution, max_cloud,
+                           pool, items, source="s2")
 
 
 # ==================================================================
@@ -522,9 +674,9 @@ def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
         load_bbox = _mask_extent(crop, bbox)
 
     items = None if s2_items is None else items_in_bbox(s2_items, load_bbox)
-    scenes = load_s2_ndvi_stack(load_bbox, start, end, items=items)
+    scenes = load_ndvi_stack(load_bbox, start, end, items=items)
     if scenes is None or scenes.sizes.get("time", 0) == 0:
-        print(f"  no S2 L2A coverage for {start}..{end} at {_fmt_bbox(load_bbox)} — skipping")
+        print(f"  no {DATA_SOURCE.upper()} coverage for {start}..{end} at {_fmt_bbox(load_bbox)} — skipping")
         return None, "no_s2"
 
     cube = composite_to_anchors(scenes, start, end, align=align)
@@ -537,7 +689,8 @@ def _build_tile(bbox, planting_month, year, apply_cropland_mask=True,
     ds.attrs.update({"spatial_dims": ["y", "x"],
                      "window_start": str(start), "window_end": str(end),
                      "interval_days": INTERVAL_DAYS,
-                     "resolution_m": round(GRID_SCALE_DEG * M_PER_DEG, 2)})
+                     "resolution_m": round(GRID_SCALE_DEG * M_PER_DEG, 2),
+                     "data_source": DATA_SOURCE})
     return ds, None
 
 
@@ -615,7 +768,7 @@ def _cache_key(window, align, apply_cropland_mask, cache_tag=""):
     never serves tiles built with other settings (other period end, grid,
     compositing, phenology parameters passed as cache_tag, ...)."""
     import hashlib
-    parts = (window, align, apply_cropland_mask, round(GRID_SCALE_DEG, 9),
+    parts = (DATA_SOURCE, window, align, apply_cropland_mask, round(GRID_SCALE_DEG, 9),
              INTERVAL_DAYS, COMPOSITE_METHOD, MAX_SCENE_CLOUD,
              tuple(SCL_CLEAR_CLASSES), str(cache_tag))
     return hashlib.md5(repr(parts).encode()).hexdigest()[:10]
@@ -725,18 +878,18 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
         sb = (min(t[0] for t in todo), min(t[1] for t in todo),
               max(t[2] for t in todo), max(t[3] for t in todo))
         start, end = window
-        s2_items = search_s2_items(sb, start, end)
+        s2_items = search_optical_items(sb, start, end)
         if apply_cropland_mask:
             # a province is on land, so an empty result here is transient MPC
             # trouble — let NoWorldCoverError fail the province (retried later)
             # rather than skipping every tile as "offshore"
             wc_items = worldcover_items(sb)
-        print(f"  STAC: {len(s2_items)} S2 item(s)"
+        print(f"  STAC: {len(s2_items)} {DATA_SOURCE.upper()} item(s)"
               + (f", {len(wc_items)} WorldCover item(s)" if apply_cropland_mask else ""))
         if not s2_items:
             # an empty province-wide search is almost certainly transient MPC
             # trouble (the retry already ran) — fail so skip_existing retries
-            raise RuntimeError(f"no S2 L2A items for province bbox {_fmt_bbox(sb)} "
+            raise RuntimeError(f"no {DATA_SOURCE.upper()} items for province bbox {_fmt_bbox(sb)} "
                                f"{start}..{end}")
 
     def run_tile(tb):
