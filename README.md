@@ -73,15 +73,81 @@ HLS v2 or S2 L2A (Microsoft Planetary Computer) → Fmask / SCL cloud mask → 1
 | `apps/data_processing.py` | Season window, S2 NDVI loading from MPC, compositing, cropland mask, tiling/mosaicking, clipping to the province boundary |
 | `apps/phenology.py` | Per-pixel phenology (transition dates + QC), stage classification (date, month or any period), spatial clean-up, COG export |
 | `apps/pipeline.py` | The two run modes: periods, admin-unit selection, periodic and recent runs, area summaries |
-| `run_growth_stages.ipynb` | Colab driver: config, GCS auth, a quick-check AOI with plots, the periodic batch and the recent run |
+| `apps/runner.py` | `RunConfig` + `Runner`: runs either mode end to end and saves maps, hectares CSVs and run logs to the output store |
+| `apps/output_store.py` | Output destinations: Cloud Storage, Google Drive, both, or a local folder |
+| `apps/agent.py` | CropGrowth Agent: an LLM with tools over `Runner` (plain-language requests, approval before long runs) |
+| `apps/llm.py` | LLM backends: Gemini (`google-genai`) and any OpenAI-compatible API (OpenRouter → Qwen) |
+| `run_growth_stages.ipynb` | Colab driver: config, sign-in, a quick-check AOI with plots, then the periodic, recent or agent sections |
+
+## Output destinations
+
+Set `OUTPUT_TARGET` in the notebook (`RunConfig.output_target`). To change it
+mid-session, use `runner.update(output_target=...)`, or tell the agent ("save
+to Drive").
+
+| Target | Where | Needs |
+|---|---|---|
+| `'gcs'` | `gs://GCS_BUCKET/<path>` | the GCS sign-in cells |
+| `'gdrive'` | `DRIVE_OUTPUT_ROOT/<path>` (default `MyDrive/AI-CropGrowth/outputs`) | Drive mounted (`drive.mount`) |
+| `'both'` | both of the above | both |
+| `'local'` | `local_root/<path>` | nothing |
+
+- **Same layout everywhere.** Paths and file names are the same in every
+  destination: maps under `GCS_PREFIX` / `RECENT_PREFIX`, hectares-per-stage
+  CSVs under `…/summary/`, and one CSV log per run under `…/runs/`.
+- **GCS sign-in only when needed.** The sign-in cells run only when the target
+  includes GCS.
+- **Skipping existing files.** `skip_existing` checks the destination you
+  chose. With `'both'`, a map is skipped only when both stores already have it.
+
+## CropGrowth Agent
+
+`MODE = 'agent'` turns the pipeline into a tool-using agent. Example requests:
+
+- *"Map the current growth stage of Science City of Muñoz and save it to Google Drive."*
+- *"Make last month's maps for the provinces of Region III, semimonthly."*
+- *"Which provinces failed? Retry them."*
+- *"How many hectares were reproductive in Bohol in February?"*
+
+The agent has 10 tools, each a thin wrapper over `Runner`:
+
+| Tool | Does |
+|---|---|
+| `get_settings` / `update_settings` | read or change data source, grid, cadence, periods, output destination, phenology thresholds (validated) |
+| `list_areas` | look up exact province, region, municipal or barangay names |
+| `plan_periodic_run` | dry run: provinces, tiles, periods, destination (downloads nothing) |
+| `run_periodic` | national / regional / provincial maps (**asks for approval first**) |
+| `run_recent` | current stage for municipal / barangay areas or a bbox |
+| `quick_check` | QC counts on a small bbox, to sanity-check thresholds |
+| `list_outputs` / `read_summary` | what's saved, and hectares per stage from saved CSVs |
+| `last_run` | successes and failures (with errors) of the last run, for retries |
+
+- **Models:** Gemini by default (`GEMINI_API_KEY`). Qwen via OpenRouter
+  (`OPENROUTER_API_KEY`) is the fallback.
+  - When Gemini is rate-limited, overloaded or unreachable, the request carries
+    on with Qwen mid-conversation. `llm.py` keeps one provider-neutral history.
+  - The next request tries Gemini again.
+- **API keys:** in Colab, put them in **Secrets**.
+- **Grounded answers:** the system prompt tells the agent to report only
+  numbers that come from tool results, and to list every failure.
+- **Approval step:** `confirm(tool, args, plan)` defaults to a y/N prompt that
+  shows the plan. Pass `confirm=None` to skip it, e.g. for scheduled runs.
+- **Without the notebook:**
+  ```python
+  from runner import RunConfig, Runner
+  from agent import CropGrowthAgent
+  runner = Runner(RunConfig(vector_path=..., aoi_path=..., output_target='gdrive'))
+  agent = CropGrowthAgent(runner)
+  print(agent.chat("Current stage for Science City of Muñoz"))
+  ```
 
 ## Setup (Google Colab)
 
-1. Put `apps/` (all three `.py` files) on Google Drive and point the
+1. Put `apps/` (all the `.py` files) on Google Drive and point the
    `sys.path.insert(...)` line in the notebook's config cell at it.
-2. Run the install cell:
-   `pip install pystac-client odc-stac planetary-computer xarray rioxarray scipy geopandas matplotlib google-cloud-storage`.
-3. Authenticate to GCS (the `gcloud auth` + impersonation cells).
+2. Run the install cell, or `pip install -r requirements.txt`.
+3. Choose `OUTPUT_TARGET`. For Cloud Storage, run the sign-in cells; for Drive,
+   mount it (already in the notebook).
 4. Set `MODE`, then that mode's settings in the config cell: `AREA_LEVEL`,
    `CADENCE`, `YEAR`, `VECTOR_PATH`, ... for periodic, or `AOI_PATH`,
    `AOI_NAME_COL`, `AOI_NAMES` for recent.

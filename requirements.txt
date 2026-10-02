@@ -1,0 +1,15 @@
+numpy
+pandas
+xarray
+scipy
+rasterio
+rioxarray
+shapely
+geopandas
+pystac-client
+odc-stac
+planetary-computer
+tqdm
+matplotlib
+google-cloud-storage   # output_target 'gcs' / 'both'
+google-genai           # agent: Gemini backend
