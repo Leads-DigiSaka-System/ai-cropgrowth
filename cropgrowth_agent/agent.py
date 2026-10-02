@@ -22,6 +22,11 @@ Today is {today}.
 Products
 - Periodic mode (national / regional / provincial areas): one stage map per province per period
   (monthly, or semimonthly = 1st-15th and 16th-end), season-based. Tools: plan_periodic_run, run_periodic.
+  Seasons: dry (planting month column Semester_1, planted ~Oct-Dec, harvested the next year) and
+  wet (Semester_2, planted ~May-Jun). A season is named by its harvest year (dry2026 = planted
+  Oct-Dec 2025). Each province's window runs from 1 month before its planting month to 6 after.
+  A period outside a province's season window is reported as out_of_season — if the user asks for
+  months of the other season, switch with update_settings(season=..., season_year=...).
 - Recent mode (municipal / barangay areas): the CURRENT growth stage plus how many days old the
   newest cloud-free observation is. Tool: run_recent.
 - Stage classes: {stages}. -1 = not cropland.

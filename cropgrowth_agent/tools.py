@@ -33,7 +33,12 @@ TOOLS = [
          "periods": {"type": "string", "enum": ["last_complete", "current", "season"]},
          "stage_method": {"type": "string", "enum": ["dominant", "midpoint"]},
          "output_target": {"type": "string", "enum": ["gcs", "gdrive", "both", "local"]},
-         "year": {"type": "integer", "description": "season year (planting month of this year)"},
+         "season": {"type": "string", "enum": list(pl.SEASONS),
+                    "description": "dry (Semester_1 planting months, ~Oct-Dec) or wet "
+                                   "(Semester_2, ~May-Jun); switches the planting-month column"},
+         "season_year": {"type": "integer",
+                         "description": "harvest year naming the season: dry2026 = planted "
+                                        "Oct-Dec 2025; wet2026 = planted May-Jun 2026"},
          "lookback_days": {"type": "integer", "description": "recent-mode window length"},
          "tile_workers": {"type": "integer"},
          "pheno": {"type": "object", "description": "phenology thresholds to change",
@@ -177,6 +182,7 @@ class ToolRunner:
     def t_get_settings(self):
         c = self.runner.cfg.public()
         c["output_destination"] = self.runner.store.describe()
+        c["season_resolved"] = self.runner.cfg.season_summary()
         return c
 
     def t_update_settings(self, pheno=None, **changes):

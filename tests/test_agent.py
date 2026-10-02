@@ -36,7 +36,8 @@ def answer(text):
 def runner(mpc, boundaries, tmp_path):
     cfg = RunConfig(resolution_m=dp.GRID_SCALE_DEG * dp.M_PER_DEG, tile_deg=0.1, tile_workers=1,
                     date_median_radius=0, vector_path=boundaries["provinces"], region_col="Reg_Name",
-                    aoi_path=boundaries["aoi"], output_target="local", local_root=str(tmp_path / "out"))
+                    aoi_path=boundaries["aoi"], output_target="local", local_root=str(tmp_path / "out"),
+                    season_year=2026)
     return Runner(cfg, log=lambda *a: None)
 
 
@@ -58,12 +59,12 @@ def test_tool_loop(runner):
 
 
 def test_recent_request_end_to_end(runner):
-    g = Scripted("gemini", [call("update_settings", {"output_target": "local", "year": 2025.0}, "c1"),
+    g = Scripted("gemini", [call("update_settings", {"output_target": "local", "season_year": 2026.0}, "c1"),
                             call("run_recent", {"names": ["MUÑOZ TOWN"], "as_of": "2026-03-20"}, "c2"),
                             answer("mostly vegetative")])
     a = agent(runner, g)
     assert a.run("current stage of Muñoz") == "mostly vegetative"
-    assert runner.cfg.year == 2025 and isinstance(runner.cfg.year, int)       # Gemini floats coerced
+    assert runner.cfg.season_year == 2026 and isinstance(runner.cfg.season_year, int)   # Gemini floats coerced
     res = json.loads(a.messages[-2]["content"])
     assert list(res["success"][0]["hectares"]) == ["vegetative"]
     assert "_data" not in res["success"][0]                                    # no arrays sent to the model

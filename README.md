@@ -80,6 +80,28 @@ HLS v2 (Landsat 8/9 + Sentinel-2) or Sentinel-2 L2A  (Microsoft Planetary Comput
   young crop isn't mistaken for the previous harvested one. `data_age_days` shows how stale each pixel's stage
   is: Sentinel-2 / Landsat revisit every few days, but clouds can hide a field for weeks.
 
+### Seasons
+
+The planting-month column of the province file chooses the season:
+
+| `plant_mo_col` | Season | Usual planting | Named by its harvest year (`season_year`) | Fallback month |
+|---|---|---|---|---|
+| `Semester_1` | dry | Oct–Dec (some provinces Jan–Mar) | `dry2026` = planted Oct–Dec 2025 or Jan–Mar 2026 | 12 |
+| `Semester_2` | wet | May–Jun | `wet2026` = planted May–Jun 2026 | 6 |
+
+- **Per-province window:** each province is processed from one month before its planting month to six months
+  after. For dry2026, a November planting gives 2025-10-01 to 2026-05-31, and a January planting gives
+  2025-12-01 to 2026-07-31. For wet2026, a June planting gives 2026-05-01 to 2026-12-31.
+- **Planting-month values:** numbers (`5`, `5.0`, `"5"`), month names (`May`, `June`) and ranges (`5-6`,
+  `May-June`, which use the first month) are all read. An empty or unreadable cell uses the season's fallback
+  month, and the plan flags it.
+- **File names and folder:** follow the season (`wet2026_<PROVINCE>_202609.tiff` under
+  `products/growth_stage/2026/wet`) unless you set `cog_label` / `output_prefix`.
+- **Out of season:** a period outside a province's window is reported as `out_of_season`. For example, a monthly
+  run in October makes September maps for wet2026 but none for dry2026.
+- **Switching seasons:** to switch, change `plant_mo_col` (or set `season='wet'`) and `season_year`. The agent
+  does the same when asked ("switch to the wet season").
+
 ### Data sources
 
 | | **`hls`** (default): Harmonized Landsat Sentinel-2 v2.0 | **`s2`**: Sentinel-2 L2A |
@@ -153,9 +175,9 @@ python -m cropgrowth_agent outputs     --config config.json --kind periodic
 ```json
 {
   "vector_path": "/data/vector/boundary_province_philippines.gpkg",
-  "prov_col": "Pro_Name", "region_col": "Reg_Name", "plant_mo_col": "Semester_1",
+  "prov_col": "Pro_Name", "region_col": "Reg_Name", "plant_mo_col": "Semester_2",
   "aoi_path": "/data/vector/boundary_municipal_philippines.gpkg", "aoi_name_col": "Mun_Name",
-  "year": 2025, "cog_label": "dry2026", "output_prefix": "products/growth_stage/2026/dry",
+  "season_year": 2026,
   "cadence": "monthly", "data_source": "hls", "resolution_m": 30,
   "output_target": "gdrive", "drive_root": "/content/drive/MyDrive/AI-CropGrowth/outputs",
   "tile_cache_dir": "/data/tile_cache"
@@ -171,7 +193,9 @@ python -m cropgrowth_agent outputs     --config config.json --kind periodic
 | `cadence` | `monthly` | `monthly` or `semimonthly` |
 | `periods` | `last_complete` | `last_complete`, `current` or `season` |
 | `stage_method` | `dominant` | Stage that fills most of the period, or `midpoint` |
-| `year` | 2025 | Season = planting month of this year |
+| `plant_mo_col` | `Semester_1` | Planting-month column: `Semester_1` = dry season, `Semester_2` = wet season |
+| `season_year` | season in progress | Harvest year naming the season (`dry2026`, `wet2026`) |
+| `planting_month_fallback` | 12 dry / 6 wet | Month used when a province has no planting month |
 | `lookback_days` | 240 | Recent-mode window |
 | `output_target` | `gcs` | `gcs`, `gdrive`, `both` or `local` |
 | `pheno_cfg` | see `runner.DEFAULT_PHENO_CFG` | Phenology thresholds (all in `phenology.DEFAULTS`) |
