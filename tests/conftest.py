@@ -55,8 +55,8 @@ class FakeMPC:
         self.cloudy_every = 0                  # every n-th scene fully cloudy (0 = none)
         self.searches, self.loads = [], []
         self.window = None
-        self.s2_dates = pd.date_range("2025-06-01", "2026-06-30", freq="5D")
-        self.l30_dates = pd.date_range("2025-06-03", "2026-06-30", freq="8D")
+        self.s2_dates = pd.date_range("2025-06-01", "2026-12-31", freq="5D")
+        self.l30_dates = pd.date_range("2025-06-03", "2026-12-31", freq="8D")
 
     # -- STAC
     def search(self, collections, bbox, datetime=None, **kw):
@@ -138,7 +138,8 @@ def boundaries(tmp_path):
     gpd = pytest.importorskip("geopandas")
     from shapely.geometry import box
     prov = gpd.GeoDataFrame(
-        {"Pro_Name": ["Alpha", "Beta", "Palawan"], "Reg_Name": ["R1", "R1", "R4"], "Semester_1": [12, 12, 12]},
+        {"Pro_Name": ["Alpha", "Beta", "Palawan"], "Reg_Name": ["R1", "R1", "R4"], "Semester_1": [12, 12, 12],
+         "Semester_2": ["6", None, "May"]},          # text, missing and month-name values, as in real tables
         geometry=[box(120.0, 10.0, 120.1, 10.1), box(120.1, 10.0, 120.2, 10.1), box(120.2, 10.0, 120.3, 10.1)],
         crs=4326)
     mun = gpd.GeoDataFrame({"Mun_Name": ["Muñoz Town"]}, geometry=[box(120.0, 10.0, 120.05, 10.05)], crs=4326)

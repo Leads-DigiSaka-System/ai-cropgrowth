@@ -10,7 +10,7 @@ from cropgrowth_agent.runner import RunConfig, Runner
 def runner(mpc, boundaries, tmp_path):
     cfg = RunConfig(data_source="hls", resolution_m=dp.GRID_SCALE_DEG * dp.M_PER_DEG, tile_deg=0.1,
                     tile_workers=1, date_median_radius=0, vector_path=boundaries["provinces"],
-                    region_col="Reg_Name", aoi_path=boundaries["aoi"], output_target="local",
+                    region_col="Reg_Name", aoi_path=boundaries["aoi"], output_target="local", season_year=2026,
                     local_root=str(tmp_path / "outputs"))
     return Runner(cfg, log=lambda *a: None)
 

@@ -32,6 +32,7 @@ SETTINGS = {
     "--data-source": ("data_source", str), "--resolution": ("resolution_m", float),
     "--tile-deg": ("tile_deg", float), "--tile-workers": ("tile_workers", int),
     "--tile-cache-dir": ("tile_cache_dir", str), "--year": ("year", int),
+    "--season": ("season", str), "--season-year": ("season_year", int),
     "--cadence": ("cadence", str), "--periods": ("periods", str),
     "--cog-label": ("cog_label", str), "--output-prefix": ("output_prefix", str),
     "--recent-prefix": ("recent_prefix", str), "--lookback-days": ("lookback_days", int),

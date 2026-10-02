@@ -25,6 +25,7 @@ Admin-unit selection for both: select_units(gdf, level, names, ...).
 ==================================================================
 """
 
+import re
 from collections import namedtuple
 
 import numpy as np
@@ -78,6 +79,79 @@ def periods_between(start, end, cadence="monthly"):
         out.append(p)
         p = period_of(p.end, cadence)
     return out
+
+
+# ==================================================================
+# Cropping seasons
+# ==================================================================
+# Philippine rice seasons and the province-table column holding each one's
+# planting month:
+#   dry : Semester_1, planted ~Oct-Dec (some provinces Jan-Mar), harvested the next year
+#   wet : Semester_2, planted ~May-Jun, harvested the same year
+# A season is named by its HARVEST year: dry2026 = planted Oct-Dec 2025 (or Jan-Mar 2026),
+# wet2026 = planted May-Jun 2026.
+SEASONS = ("dry", "wet")
+SEASON_COLUMNS = {"dry": "Semester_1", "wet": "Semester_2"}
+SEASON_BY_COLUMN = {v.upper(): k for k, v in SEASON_COLUMNS.items()}
+SEASON_FALLBACK_MONTH = {"dry": 12, "wet": 6}   # when a province has no planting month
+SEASON_TYPICAL_MONTHS = {"dry": {9, 10, 11, 12, 1, 2, 3}, "wet": {4, 5, 6, 7, 8}}
+DRY_PREV_YEAR_FROM = 7                           # dry season: months Jul-Dec are the year before
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def season_from_column(col):
+    """'Semester_1' -> 'dry', 'Semester_2' -> 'wet', anything else -> None."""
+    return SEASON_BY_COLUMN.get(str(col or "").strip().upper())
+
+
+def parse_month(value):
+    """Planting month from a table cell: 5, 5.0, '5', 'May', 'MAY', 'June', '5-6',
+    'May-June' (first month of a range). None when empty / unreadable / 0."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        m = int(round(float(value)))
+        return m if 1 <= m <= 12 else None
+    text = str(value).strip().lower()
+    num = re.match(r"^(\d{1,2})(?:\.0+)?(?:\s*[-/–]\s*\d{1,2})?$", text)
+    if num:
+        m = int(num.group(1))
+        return m if 1 <= m <= 12 else None
+    word = re.match(r"^([a-z]{3,})", text)
+    if word:
+        return _MONTHS.get(word.group(1)[:3])
+    return None
+
+
+def planting_year(month, season, season_year):
+    """Calendar year of a planting month in a season named by its harvest year:
+    wet -> season_year; dry -> season_year - 1 for Jul-Dec, season_year for Jan-Jun."""
+    if season == "dry" and month >= DRY_PREV_YEAR_FROM:
+        return season_year - 1
+    return season_year
+
+
+def default_season_year(season, today=None):
+    """The season in progress / most recently started at `today`."""
+    t = pd.Timestamp(today or pd.Timestamp.today())
+    if season == "dry":
+        return t.year + 1 if t.month >= DRY_PREV_YEAR_FROM else t.year
+    return t.year
+
+
+def season_label(season, season_year):
+    return f"{season}{season_year}"
+
+
+def season_prefix(season, season_year, root="products/growth_stage"):
+    return f"{root}/{season_year}/{season}"
 
 
 # ==================================================================
