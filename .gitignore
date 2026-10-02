@@ -1,3 +1,17 @@
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks
 .ipynb_checkpoints/
+
+# Secrets
+.env
+
+# Generated locally: outputs, tile caches, configs with local paths
+outputs/
+tile_cache/
+config.local.json

@@ -23,10 +23,10 @@ from dataclasses import dataclass, field, fields
 import numpy as np
 import pandas as pd
 
-import data_processing as dp
-import phenology as ph
-import pipeline as pl
-import output_store as storage
+from . import data_processing as dp
+from . import phenology as ph
+from . import pipeline as pl
+from . import output_store as storage
 
 DEFAULT_PHENO_CFG = dict(
     THRESHOLD_FRAC=0.15, BASE_MODE="separate", SG_WINDOW=5, SG_POLYORDER=2,
@@ -293,7 +293,7 @@ class Runner:
         only : restrict to these province names (e.g. retrying failures).
         Returns {'success': [...], 'skipped', 'out_of_season', 'no_coverage', 'failed'}.
         """
-        from data_processing import tqdm
+        from .data_processing import tqdm
         as_of = self._as_of(as_of)
         units = self.select(level, names)
         provs = sorted(units[self.cfg.prov_col])

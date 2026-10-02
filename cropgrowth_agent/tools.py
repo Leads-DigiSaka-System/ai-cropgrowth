@@ -1,39 +1,14 @@
+"""Tools the agent can call. Each returns a JSON-serialisable dict.
+
+TOOLS holds the schemas (Gemini function-declaration format, also sent to
+OpenAI-compatible models); ToolRunner implements them as t_<name> methods on
+top of runner.Runner, so every number the agent reports comes from the pipeline.
 """
-agent.py
-==================================================================
-CropGrowth Agent: a tool-using LLM agent that runs the rice growth-stage
-pipeline from plain-language requests, e.g.
-
-    "Map the current growth stage of Science City of Muñoz and save it to Drive"
-    "Run the February maps for Region III, semimonthly"
-    "Which provinces failed last run? Retry them."
-
-How it works
-  * The LLM (Gemini by default, Qwen through OpenRouter as fallback — see
-    llm.py) plans and calls TOOLS; the tools are thin wrappers around
-    runner.Runner, so every number it reports comes from the pipeline.
-  * Gemini rate limits / overload / network errors are retried, then the
-    conversation moves to the fallback model mid-turn (llm.py keeps one
-    provider-neutral history).
-  * Expensive tools (run_periodic by default) need human approval: the
-    agent shows the plan (provinces, tiles, periods, output location) and
-    calls `confirm(tool, args, plan) -> bool` first.
-
-    agent = CropGrowthAgent(runner)                  # GEMINI_API_KEY / OPENROUTER_API_KEY
-    print(agent.chat("What areas can you map?"))
-==================================================================
-"""
-
 from __future__ import annotations
 
 import json
-import time
 
-import pandas as pd
-
-import phenology as ph
-import pipeline as pl
-from llm import TransientLLMError, make_backend
+from . import pipeline as pl
 
 # ------------------------------------------------------------------ tool schemas
 _STR = {"type": "string"}
@@ -114,39 +89,18 @@ TOOLS = [
      "description": "Hectares per growth stage from a saved *_summary.csv / summary/*.csv path "
                     "(as listed by list_outputs).",
      "parameters": {"type": "object", "properties": {"path": _STR}, "required": ["path"]}},
+    {"name": "search_method_docs",
+     "description": "Search this project's documentation and code (README, module and function "
+                    "docstrings) for how the method works: thresholds, stage rules, QC codes, data "
+                    "sources, outputs. Use for questions about the method, not to run it.",
+     "parameters": {"type": "object", "properties": {
+         "query": _STR, "k": {"type": "integer"}}, "required": ["query"]}},
     {"name": "last_run",
      "description": "Result of the last periodic or recent run in this session (successes, "
                     "failures with errors, outputs).",
      "parameters": {"type": "object", "properties": {
          "kind": {"type": "string", "enum": ["periodic", "recent"]}}, "required": ["kind"]}},
 ]
-
-SYSTEM_PROMPT = """You are CropGrowth Agent. You map rice growth stages in the Philippines from
-satellite NDVI (Harmonized Landsat Sentinel-2 or Sentinel-2) by calling tools. Today is {today}.
-
-Products
-- Periodic mode (national / regional / provincial areas): one stage map per province per period
-  (monthly, or semimonthly = 1st-15th and 16th-end), season-based. Tools: plan_periodic_run, run_periodic.
-- Recent mode (municipal / barangay areas): the CURRENT growth stage plus how many days old the
-  newest cloud-free observation is. Tool: run_recent.
-- Stage classes: {stages}. -1 = not cropland.
-- QC codes: {qc}.
-
-How to work
-1. Pick the mode from the area: municipality / barangay / city / small bbox -> run_recent;
-   province / region / whole country -> periodic.
-2. Resolve place names with list_areas before running; if a name is ambiguous or missing, ask.
-3. Before run_periodic, call plan_periodic_run and state the plan (provinces, tiles, periods,
-   destination). run_periodic asks the user for approval itself.
-4. When the user says where to save (Google Drive, Cloud Storage, both), call update_settings
-   with output_target first.
-5. Report results only from tool outputs: what was made, where it was saved (URIs), hectares or
-   shares per stage, data age, and every failure with its error. Never invent numbers.
-6. For failed provinces caused by network / catalog errors, offer to retry them with
-   run_periodic(only=[...]). If a tool returns an error, read it and fix the call or explain.
-7. Be concise. Use plain language; the users are agriculture staff.
-"""
-
 
 _SCHEMAS = {t["name"]: t.get("parameters", {}) for t in TOOLS}
 
@@ -172,6 +126,7 @@ def _coerce(schema, value):
     return value
 
 
+
 def console_confirm(tool, args, plan):
     """Default approval prompt (notebook / terminal)."""
     print(f"\n[approval needed] {tool}({json.dumps(args, default=str)})")
@@ -180,132 +135,51 @@ def console_confirm(tool, args, plan):
     return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
 
 
-def _public(obj):
-    """Drop private keys (e.g. '_data' xarray payloads) for the LLM."""
+def public(obj):
+    """Drop private keys (e.g. '_data' xarray payloads) before results go to the model."""
     if isinstance(obj, dict):
-        return {k: _public(v) for k, v in obj.items() if not str(k).startswith("_")}
+        return {k: public(v) for k, v in obj.items() if not str(k).startswith("_")}
     if isinstance(obj, list):
-        return [_public(v) for v in obj]
+        return [public(v) for v in obj]
     return obj
 
 
-def _clip_json(obj, limit=12000):
-    s = json.dumps(_public(obj), default=str)
-    if len(s) <= limit:
-        return s
-    return json.dumps({"truncated": True, "preview": s[:limit]})
+# ---------------------------------------------------------------- implementations
+class ToolRunner:
+    """runner  : runner.Runner (settings, data, output store)
+    confirm : fn(tool, args, plan) -> bool, asked before the tools in confirm_tools;
+              None = no approval step
+    docs    : docs.DocsIndex for search_method_docs (None = unavailable)"""
 
+    def __init__(self, runner, confirm=console_confirm, confirm_tools=("run_periodic",),
+                 docs=None, log=print):
+        self.runner, self.confirm, self.docs, self.log = runner, confirm, docs, log
+        self.confirm_tools = set(confirm_tools or ())
 
-class CropGrowthAgent:
-    def __init__(self, runner, primary="gemini", fallback="openrouter", primary_model=None,
-                 fallback_model=None, api_keys=None, confirm=console_confirm,
-                 confirm_tools=("run_periodic",), max_steps=25, max_tokens=4000,
-                 retries=2, log=print, backends=None):
-        """
-        runner        : runner.Runner
-        primary / fallback : llm.make_backend providers ('gemini' | 'openrouter');
-                        fallback=None disables switching
-        api_keys      : optional {'gemini': key, 'openrouter': key} (else env vars)
-        confirm       : fn(tool, args, plan) -> bool for tools in confirm_tools;
-                        None = no approval step
-        backends      : pre-built backends (tests / custom servers), overrides the above
-        """
-        self.runner, self.log = runner, log
-        self.confirm, self.confirm_tools = confirm, set(confirm_tools or ())
-        self.max_steps, self.max_tokens, self.retries = max_steps, max_tokens, retries
-        keys = api_keys or {}
-        self._specs = [] if backends else [(p, m, keys.get(p)) for p, m in
-                                          ((primary, primary_model), (fallback, fallback_model)) if p]
-        self._backends = list(backends) if backends else [None] * len(self._specs)
-        self.messages: list[dict] = []
-        self._active = 0                                 # backend in use for the current turn
-        self.tools = {
-            "get_settings": self._get_settings, "update_settings": self._update_settings,
-            "list_areas": self._list_areas, "plan_periodic_run": self._plan,
-            "run_periodic": self._run_periodic, "run_recent": self._run_recent,
-            "quick_check": self._quick_check, "list_outputs": self._list_outputs,
-            "read_summary": self._read_summary, "last_run": self._last_run,
-        }
-
-    # ------------------------------------------------------------ LLM plumbing
-    def _backend(self, i):
-        if self._backends[i] is None:
-            p, m, k = self._specs[i]
-            self._backends[i] = make_backend(p, m, k)
-        return self._backends[i]
-
-    def _system(self):
-        return SYSTEM_PROMPT.format(
-            today=pd.Timestamp.today().date(),
-            stages="; ".join(f"{k} {v}" for k, v in ph.STAGE_CLASSES.items()),
-            qc="; ".join(f"{k} {v}" for k, v in ph.QC_DESCRIPTION.items()))
-
-    def _complete(self):
-        last_err = None
-        for i in range(self._active, len(self._backends)):
-            try:
-                be = self._backend(i)
-            except Exception as e:                       # e.g. fallback key missing
-                last_err = e
-                self.log(f"[agent] backend {i} unavailable: {e}")
-                continue
-            for attempt in range(self.retries + 1):
-                try:
-                    out = be.complete(self._system(), self.messages, TOOLS, self.max_tokens)
-                    self._active = i                     # stay on it for the rest of this turn
-                    return out
-                except TransientLLMError as e:
-                    last_err = e
-                    if attempt < self.retries:
-                        time.sleep(2 * 2 ** attempt)
-            if i + 1 < len(self._backends):
-                self.log(f"[agent] {be.name} unavailable ({last_err}); switching to the fallback model")
-        raise RuntimeError(f"no LLM backend available: {last_err}")
-
-    def reset(self):
-        self.messages = []
-
-    def chat(self, text: str) -> str:
-        """One user turn: the agent calls tools until it has an answer."""
-        self.messages.append({"role": "user", "content": text})
-        self._active = 0                                 # each new request tries the primary first
-        for _ in range(self.max_steps):
-            out = self._complete()
-            if out["message"] is not None:
-                self.messages.append(out["message"])
-            if not out["tool_calls"]:
-                return out["text"]
-            for call in out["tool_calls"]:
-                result = self._call_tool(call["name"], call.get("args") or {})
-                self.messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"],
-                                      "content": _clip_json(result), "_gemini_id": call.get("gemini_id")})
-        return "(stopped: too many tool steps for one request — ask me to continue)"
-
-    def _call_tool(self, name, args):
-        fn = self.tools.get(name)
+    def __call__(self, name: str, args: dict) -> dict:
+        fn = getattr(self, f"t_{name}", None)
         if fn is None:
-            return {"error": f"unknown tool {name!r}"}
-        args = _coerce(_SCHEMAS.get(name), args)
-        self.log(f"[agent] {name}({json.dumps(args, default=str)[:300]})")
+            return {"error": f"unknown tool {name}"}
+        args = _coerce(_SCHEMAS.get(name), args or {})
         try:
             if name in self.confirm_tools and self.confirm is not None:
-                plan = self._plan(**{k: args[k] for k in ("level", "names", "as_of") if k in args}) \
-                    if name == "run_periodic" else None
+                plan = self.t_plan_periodic_run(**{k: args[k] for k in ("level", "names", "as_of")
+                                                   if k in args}) if name == "run_periodic" else None
                 if not self.confirm(name, args, plan):
                     return {"status": "cancelled", "reason": "the user did not approve this run"}
-            return fn(**args)
+            return public(fn(**args))
         except TypeError as e:
             return {"error": f"bad arguments for {name}: {e}"}
         except Exception as e:
-            return {"error": f"{e.__class__.__name__}: {e}"}
+            return {"error": f"{type(e).__name__}: {e}"}
 
-    # ------------------------------------------------------------ tools
-    def _get_settings(self):
+    # -----------------------------------------------------------
+    def t_get_settings(self):
         c = self.runner.cfg.public()
         c["output_destination"] = self.runner.store.describe()
         return c
 
-    def _update_settings(self, pheno=None, **changes):
+    def t_update_settings(self, pheno=None, **changes):
         # only the fields the tool declares — paths, bucket and Drive folder stay
         # as the operator configured them
         allowed = set(_SCHEMAS["update_settings"]["properties"]) - {"pheno"}
@@ -315,18 +189,18 @@ class CropGrowthAgent:
         if pheno:
             changes["pheno_cfg"] = pheno
         self.runner.update(**changes)
-        return {"status": "updated", "settings": self._get_settings()}
+        return {"status": "updated", "settings": self.t_get_settings()}
 
-    def _list_areas(self, kind, region=None, contains=None):
+    def t_list_areas(self, kind, region=None, contains=None):
         names = self.runner.list_areas(kind, region, contains)
         return {"kind": kind, "count": len(names), "names": names[:300]}
 
-    def _plan(self, level, names=None, as_of=None):
+    def t_plan_periodic_run(self, level, names=None, as_of=None):
         plan = self.runner.plan_periodic(level, names, as_of)
         plan["detail"] = plan["detail"][:100]
         return plan
 
-    def _run_periodic(self, level, names=None, as_of=None, skip_existing=True, only=None):
+    def t_run_periodic(self, level, names=None, as_of=None, skip_existing=True, only=None):
         res = self.runner.run_periodic(level, names, as_of, skip_existing=skip_existing, only=only)
         out = {"as_of": res["as_of"], "output": self.runner.store.describe(),
                "counts": {k: len(v) for k, v in res.items() if isinstance(v, list)}}
@@ -334,20 +208,25 @@ class CropGrowthAgent:
             out[k] = res[k][:60]                         # keep the reply within the context budget
         return out
 
-    def _run_recent(self, names=None, bbox=None, as_of=None, lookback_days=None):
+    def t_run_recent(self, names=None, bbox=None, as_of=None, lookback_days=None):
         if not names and not bbox:
             return {"error": "give names (municipal / barangay) or a bbox"}
         return self.runner.run_recent(names, bbox, as_of, lookback_days)
 
-    def _quick_check(self, bbox, planting_month=None, year=None):
+    def t_quick_check(self, bbox, planting_month=None, year=None):
         return self.runner.quick_check(bbox, planting_month, year)
 
-    def _list_outputs(self, kind, contains=None):
+    def t_list_outputs(self, kind, contains=None):
         return self.runner.list_outputs(kind, contains)
 
-    def _read_summary(self, path):
+    def t_read_summary(self, path):
         return {"path": path, "rows": self.runner.read_summary(path)}
 
-    def _last_run(self, kind):
+    def t_search_method_docs(self, query, k=5):
+        if self.docs is None:
+            return {"error": "method docs index not loaded"}
+        return {"results": self.docs.search(query, k=k)}
+
+    def t_last_run(self, kind):
         res = self.runner.last_periodic if kind == "periodic" else self.runner.last_recent
         return res or {"status": f"no {kind} run yet in this session"}

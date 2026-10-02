@@ -73,7 +73,7 @@ import pandas as pd
 import xarray as xr
 from scipy.signal import savgol_filter
 
-from data_processing import NDVI_BAND
+from .data_processing import NDVI_BAND
 
 # ------------------------------------------------------------------
 # Config (all overridable per call via run_phenology(..., **overrides))
