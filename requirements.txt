@@ -12,4 +12,5 @@ planetary-computer
 tqdm
 matplotlib
 google-cloud-storage   # output_target 'gcs' / 'both'
-google-genai           # agent: Gemini backend
+google-genai           # the agent (not needed for the direct pipeline)
+# tests: pytest

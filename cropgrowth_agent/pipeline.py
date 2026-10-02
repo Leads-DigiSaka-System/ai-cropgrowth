@@ -30,8 +30,8 @@ from collections import namedtuple
 import numpy as np
 import pandas as pd
 
-import data_processing as dp
-import phenology as ph
+from . import data_processing as dp
+from . import phenology as ph
 
 CADENCES = ("monthly", "semimonthly")
 Period = namedtuple("Period", "start end label")   # [start, end), label for file names
