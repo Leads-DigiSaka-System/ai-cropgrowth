@@ -14,10 +14,12 @@ notebook directly and by the agent (agent.py) as its tools.
 
 import gc
 import os
+import re
 import shutil
 import tempfile
 import time
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field, fields
 
 import numpy as np
@@ -60,6 +62,8 @@ class RunConfig:
     #                 in progress today
     #   year          legacy: the PLANTING year of the season's main months (2025 -> dry2026 / wet2025)
     plant_mo_col: str = None
+    vector_layer: str = None               # layer of a multi-layer GeoPackage; None -> the
+                                           #   layer that has the province + planting-month columns
     season: str = None
     season_year: int = None
     year: int = None
@@ -144,6 +148,79 @@ class RunConfig:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
+def _norm_col(name):
+    return re.sub(r"[\s_\-]+", "_", str(name).strip()).lower()
+
+
+def _match_columns(columns, wanted):
+    """{wanted: actual} for each wanted column found exactly or ignoring case / spaces."""
+    by_norm = {}
+    for col in columns:
+        by_norm.setdefault(_norm_col(col), col)
+    out = {}
+    for w in wanted:
+        if w in columns:
+            out[w] = w
+        elif _norm_col(w) in by_norm:
+            out[w] = by_norm[_norm_col(w)]
+    return out
+
+
+def _list_layers(path):
+    try:
+        import pyogrio
+        return [str(l[0]) for l in pyogrio.list_layers(path)]
+    except Exception:
+        try:
+            import fiona
+            return list(fiona.listlayers(path))
+        except Exception:
+            return [None]
+
+
+def _layer_columns(path, layer):
+    import geopandas as gpd
+    try:
+        return [c for c in gpd.read_file(path, layer=layer, rows=1).columns if c != "geometry"]
+    except TypeError:                                    # very old geopandas: no `rows`
+        return [c for c in gpd.read_file(path, layer=layer).columns if c != "geometry"]
+
+
+def read_vector(path, need, optional=(), layer=None, log=print):
+    """Read the layer of `path` that has every column in `need` (case / space
+    insensitive), renaming matched columns to the requested names. Raises a
+    ValueError listing every layer's columns when none has them."""
+    import geopandas as gpd
+    layers = [layer] if layer else _list_layers(path)
+    report = {}
+    for lyr in layers:
+        cols = _layer_columns(path, lyr)
+        found = _match_columns(cols, list(need) + [o for o in optional if o])
+        report[lyr] = cols
+        if all(n in found for n in need):
+            g = gpd.read_file(path, layer=lyr).to_crs(4326)
+            rename = {a: w for w, a in found.items() if a != w}
+            if rename:
+                log(f"  columns matched: {rename}")
+                g = g.rename(columns=rename)
+            if len(layers) > 1:
+                log(f"  {os.path.basename(path)}: using layer {lyr!r}")
+            return g
+    try:
+        modified = pd.Timestamp(os.path.getmtime(path), unit="s").strftime("%Y-%m-%d %H:%M UTC")
+    except OSError:
+        modified = "unknown"
+    lines = "\n".join(f"  layer {k!r}: {v}" for k, v in report.items())
+    missing = sorted({n for n in need for cols in [report[next(iter(report))]]
+                      if n not in _match_columns(cols, [n])})
+    raise ValueError(
+        f"{path} (last modified {modified}) has no layer with the column(s) {list(need)}; "
+        f"missing in the first layer: {missing}.\n{lines}\n"
+        "If you added the column recently, Colab may still be reading the old copy of the file "
+        "from Google Drive: run `drive.mount('/content/drive', force_remount=True)` (or restart the "
+        "runtime) and check the path; for a multi-layer GeoPackage set vector_layer.")
+
+
 def _key(name):
     return str(name).strip().upper()
 
@@ -203,7 +280,8 @@ class Runner:
         if {"output_target", "gcs_bucket", "drive_root", "local_root"} & set(changes):
             self._store = None
             self.store                                       # fail now, not mid-run
-        if {"vector_path", "prov_col"} & set(changes):
+        if {"vector_path", "vector_layer", "prov_col", "plant_mo_col", "season",
+                "region_col"} & set(changes):
             self._prov_gdf = None
         if {"aoi_path", "aoi_name_col"} & set(changes):
             self._aoi_gdf = None
@@ -211,12 +289,17 @@ class Runner:
         return self.cfg.public()
 
     def provinces_gdf(self):
+        """Province table (one or more rows per province, e.g. one per municipality).
+        Picks the GeoPackage layer that has the needed columns and matches column
+        names ignoring case / spaces ('semester 2' -> 'Semester_2')."""
         if self._prov_gdf is None:
-            import geopandas as gpd
-            if not self.cfg.vector_path:
+            c = self.cfg
+            if not c.vector_path:
                 raise ValueError("vector_path (province boundaries) is not set")
-            g = gpd.read_file(self.cfg.vector_path).to_crs(4326)
-            g[self.cfg.prov_col] = g[self.cfg.prov_col].map(_key)
+            need = [c.prov_col, c.plant_col()]
+            g = read_vector(c.vector_path, need, optional=[c.region_col] if c.region_col else [],
+                            layer=c.vector_layer, log=self.log)
+            g[c.prov_col] = g[c.prov_col].map(_key)
             self._prov_gdf = g
         return self._prov_gdf
 
@@ -259,33 +342,56 @@ class Runner:
                                region_col=c.region_col, exclude=c.exclude)
 
     # ------------------------------------------------------------ periodic
-    def _pm_info(self, units, prov):
-        """(planting month, note) for a province: the month in plant_mo_col, or the
-        season's fallback when the cell is empty / unreadable (note says why)."""
-        col = self.cfg.plant_col()
+    def _planting(self, units, prov):
+        """Planting months of a province from ALL its rows (a municipal-level table has
+        one row per municipality) -> {'pm': earliest month, 'months': {month: rows},
+        'window': (start, end) covering them, 'note': str | None}.
+        Months on fewer than 10 % of the rows are treated as outliers; empty /
+        unreadable cells are ignored; with no usable value the season's fallback is used."""
+        c = self.cfg
+        col = c.plant_col()
         if col not in units:
             raise ValueError(f"planting-month column {col!r} not in the province file; "
-                             f"columns: {[c for c in units.columns if c != 'geometry']}")
-        raw = units.loc[units[self.cfg.prov_col] == prov].iloc[0][col]
-        m = pl.parse_month(raw)
-        if m is None:
-            return self.cfg.fallback_month(), f"no usable value in {col} ({raw!r}): fallback month"
-        if m not in pl.SEASON_TYPICAL_MONTHS[self.cfg.season_name()]:
-            return m, f"month {m} is unusual for the {self.cfg.season_name()} season"
-        return m, None
+                             f"columns: {[x for x in units.columns if x != 'geometry']}")
+        raw = units.loc[units[c.prov_col] == prov, col]
+        parsed = [pl.parse_month(v) for v in raw]
+        good = [m for m in parsed if m]
+        notes = []
+        if not good:
+            months, counts = [c.fallback_month()], {}
+            notes.append(f"no usable value in {col} ({raw.iloc[0]!r}): fallback month {months[0]}")
+        else:
+            counts = dict(sorted(Counter(good).items()))
+            months = [m for m, n in counts.items() if n >= max(1, 0.1 * len(good))]
+            rare = sorted(set(counts) - set(months))
+            if rare:
+                notes.append(f"months {rare} on <10% of rows ignored")
+            if len(good) < len(parsed):
+                notes.append(f"{len(parsed) - len(good)} row(s) without a usable month")
+            odd = [m for m in months if m not in pl.SEASON_TYPICAL_MONTHS[c.season_name()]]
+            if odd:
+                notes.append(f"month(s) {odd} unusual for the {c.season_name()} season")
+        s, e, pm = pl.season_window_for_months(months, c.season_name(), c.season_year_value())
+        return {"pm": pm, "months": counts, "window": (s, e), "note": "; ".join(notes) or None}
+
+    def _pm_info(self, units, prov):
+        info = self._planting(units, prov)
+        return info["pm"], info["note"]
 
     def _pm(self, units, prov):
-        return self._pm_info(units, prov)[0]
+        return self._planting(units, prov)["pm"]
 
     def window_for(self, pm):
         return dp.season_window(pm, self.cfg.planting_year(pm))
 
-    def periods_for(self, pm, as_of):
+    def periods_for(self, window, as_of):
+        """Periods to map for a season window (start, end) — or a planting month."""
         c = self.cfg
-        s, e = self.window_for(pm)
+        s, e = window if isinstance(window, tuple) else self.window_for(window)
         season = pl.periods_between(s, e, c.cadence)
         if c.periods == "season":
-            ps = pl.season_periods(pm, c.planting_year(pm), c.cadence, until=as_of)
+            u = pd.Timestamp(as_of).normalize() + pd.Timedelta(days=1)
+            ps = [p for p in season if p.end <= u]
         elif c.periods == "current":
             ps = [pl.period_of(as_of, c.cadence)]
         else:
@@ -316,12 +422,14 @@ class Runner:
         rows, n_tiles = [], 0
         for prov in sorted(units[self.cfg.prov_col]):
             sub = units.loc[units[self.cfg.prov_col] == prov]
-            pm, note = self._pm_info(units, prov)
-            ps = self.periods_for(pm, as_of)
+            info = self._planting(units, prov)
+            pm, note = info["pm"], info["note"]
+            ps = self.periods_for(info["window"], as_of)
             nt = len(dp.generate_tiles(tuple(sub.total_bounds), tile, geometry=sub))
             n_tiles += nt if ps else 0
-            s, e = self.window_for(pm)
+            s, e = info["window"]
             rows.append({"province": prov, "planting_month": pm, "window": f"{s}..{e}", "tiles": nt,
+                         **({"planting_months": info["months"]} if len(info["months"]) > 1 else {}),
                          **({"note": note} if note else {}),
                          "periods": [p.label for p in ps]})
         return {"level": level, "names": names or [], "as_of": str(as_of.date()),
@@ -338,8 +446,9 @@ class Runner:
         c = self.cfg
         sub = units.loc[units[c.prov_col] == prov]
         cache = os.path.join(c.tile_cache_dir, _fname(prov)) if c.tile_cache_dir else None
-        pm = self._pm(units, prov)
-        pheno = pl.run_periodic_unit(sub, pm, c.planting_year(pm), as_of,
+        info = self._planting(units, prov)
+        pm = info["pm"]
+        pheno = pl.run_periodic_unit(sub, pm, c.planting_year(pm), as_of, window=info["window"],
                                      tile_deg=c.effective_tile_deg(), pheno_cfg=c.pheno_cfg,
                                      cache_dir=cache, tile_workers=c.tile_workers,
                                      date_median_radius=c.date_median_radius)
@@ -396,7 +505,7 @@ class Runner:
         if skip_existing:
             self.store.refresh(self.cfg.prefix() + "/")
         for prov in tqdm(provs, desc="provinces", unit="prov"):
-            ps = self.periods_for(self._pm(units, prov), as_of)
+            ps = self.periods_for(self._planting(units, prov)["window"], as_of)
             if not ps:
                 res["out_of_season"].append(prov); continue
             if skip_existing and all(self.store.exists(self._stage_rel(prov, p)) for p in ps):
