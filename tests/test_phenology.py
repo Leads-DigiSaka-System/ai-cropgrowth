@@ -82,3 +82,68 @@ def test_cog_writers_roundtrip(tmp_path):
         assert np.array_equal(r.read(1), st.values)
     with rasterio.open(tmp_path / "r.tif") as r:
         assert r.descriptions == ("growth_stage", "data_age_days", "qc")
+
+
+# ---- stages are not forced when the series doesn't show them (cases from real wet-season pixels:
+#      10-day composites May-Dec 2026, clear observations end 2026-09-28)
+_T = pd.date_range("2026-05-01", "2026-12-31", freq="10D")
+
+
+def _pixels(**series):
+    last = pd.Timestamp("2026-09-28")
+    cols = []
+    for pts in series.values():
+        d = pd.to_datetime([p[0] for p in pts])
+        x = np.interp(_T.values.astype("int64"), d.values.astype("int64"), [p[1] for p in pts])
+        x[_T > last] = np.nan
+        cols.append(x)
+    X = np.stack(cols, axis=1)[:, None, :]
+    ds = xr.DataArray(X, dims=("time", "y", "x"),
+                      coords={"time": _T, "y": [10.0], "x": np.arange(X.shape[2])}).to_dataset(name="NDVI")
+    ds.attrs.update(spatial_dims=["y", "x"], window_start="2026-05-01", window_end="2026-12-31")
+    out = ph.run_phenology(ds)
+    return {k: out.isel(y=0, x=i) for i, k in enumerate(series)}, out
+
+
+def test_no_peak_or_harvest_while_ndvi_is_still_high():
+    p, out = _pixels(high_end=[("2026-05-01", .37), ("2026-05-20", .59), ("2026-06-20", .65), ("2026-07-10", .37),
+                               ("2026-08-01", .50), ("2026-09-01", .72), ("2026-09-20", .81), ("2026-09-28", .77)])
+    q = p["high_end"]
+    assert int(q["qc"]) == ph.QC_ONGOING_PRE
+    assert all(np.isnan(float(q[b])) for b in ("heading", "peak", "maturity", "harvest"))
+    assert np.isfinite(float(q["emergence"]))
+    assert ph.classify_stage(out, "2026-10-01").values[0, 0] == 3          # reproductive, not harvested
+
+
+def test_full_cycle_keeps_its_dates():
+    p, _ = _pixels(full=[("2026-05-01", .23), ("2026-05-20", .22), ("2026-06-01", .24), ("2026-07-10", .72),
+                         ("2026-07-31", .85), ("2026-08-31", .77), ("2026-09-20", .71), ("2026-09-28", .44)])
+    q = p["full"]
+    assert int(q["qc"]) == ph.QC_COMPLETE
+    for b in ("plant", "emergence", "panicle_init", "heading", "peak", "maturity", "harvest"):
+        assert np.isfinite(float(q[b])), b
+    order = [float(q[b]) for b in ("plant", "emergence", "panicle_init", "heading", "peak", "maturity", "harvest")]
+    assert order == sorted(order)
+
+
+def test_planting_not_reported_when_rise_starts_at_first_image():
+    p, _ = _pixels(early=[("2026-05-01", .21), ("2026-05-10", .27), ("2026-06-01", .55), ("2026-06-21", .73),
+                          ("2026-07-21", .67), ("2026-09-20", .54), ("2026-09-28", .46)])
+    q = p["early"]
+    assert np.isnan(float(q["plant"]))                                     # trough not observed
+    assert np.isfinite(float(q["emergence"])) and np.isfinite(float(q["peak"]))
+
+
+def test_reported_dates_are_never_out_of_order():
+    rng = np.random.default_rng(0)
+    base = 0.2 + 0.6 * np.exp(-0.5 * (((_T - pd.Timestamp("2026-07-25")).days.values) / 22.0) ** 2)
+    X = base[:, None] + rng.normal(0, 0.06, (len(_T), 400))
+    X[rng.random(X.shape) < 0.3] = np.nan
+    ds = xr.DataArray(X[:, None, :].astype("float32"), dims=("time", "y", "x"),
+                      coords={"time": _T, "y": [10.0], "x": np.arange(400)}).to_dataset(name="NDVI")
+    ds.attrs.update(spatial_dims=["y", "x"], window_start="2026-05-01")
+    out = ph.run_phenology(ds)
+    D = np.stack([out[b].values[0] for b in ph.DATE_BANDS])
+    for i in range(D.shape[1]):
+        v = D[:, i][np.isfinite(D[:, i])]
+        assert (np.diff(v) >= 0).all(), dict(zip(ph.DATE_BANDS, D[:, i]))

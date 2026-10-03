@@ -92,6 +92,14 @@ The planting-month column of the province file chooses the season:
 - **Per-province window:** each province is processed from one month before its planting month to six months
   after. For dry2026, a November planting gives 2025-10-01 to 2026-05-31, and a January planting gives
   2025-12-01 to 2026-07-31. For wet2026, a June planting gives 2026-05-01 to 2026-12-31.
+- **Reading the province file:**
+  - If the file has several layers, the code uses the one that has the province and planting-month columns
+    (or the layer you name in `vector_layer`).
+  - Column names match ignoring case and spaces (`semester 2` = `Semester_2`).
+  - With a municipal-level table (one row per municipality), a province's planting months come from all its
+    rows. The window covers the earliest to the latest month; months on fewer than 10 % of the rows are
+    ignored.
+  - If the column isn't found, the error lists every layer's columns.
 - **Planting-month values:** numbers (`5`, `5.0`, `"5"`), month names (`May`, `June`) and ranges (`5-6`,
   `May-June`, which use the first month) are all read. An empty or unreadable cell uses the season's fallback
   month, and the plan flags it.
@@ -101,6 +109,24 @@ The planting-month column of the province file chooses the season:
   run in October makes September maps for wet2026 but none for dry2026.
 - **Switching seasons:** to switch, change `plant_mo_col` (or set `season='wet'`) and `season_year`. The agent
   does the same when asked ("switch to the wet season").
+
+### Only stages the data shows
+
+A date is reported only when the NDVI series actually shows it; otherwise it stays empty (NaN). Nothing is
+moved onto a neighbouring date to fill a gap.
+
+- **Peak:** counted only once NDVI has visibly fallen after it, by at least `PEAK_CONFIRM_FRAC` (10 %) of the
+  amplitude. A crop still high when the data ends is QC 2, "peak not confirmed". It has no peak, heading,
+  maturity or harvest, and its stage stays vegetative / reproductive.
+- **Harvest and maturity:** need a real decline after the peak, at least `MIN_FALL_FRAC` (40 %) of the amplitude.
+  A shallow dip at the end of the data is not a harvest.
+- **Planting:** not reported when the lowest NDVI is the first observation, because the trough may lie before the
+  data starts.
+- **Tillering and panicle initiation:** come from the maximum acceleration and maximum growth rate. They are
+  reported only when that maximum is inside the rising limb, not on its first or last step.
+- **Heading:** reported only when its crossing is observed.
+- **Order:** a date out of order with its neighbours is dropped.
+- **"Complete cycle" (QC 0):** means the harvest was observed.
 
 ### Data sources
 

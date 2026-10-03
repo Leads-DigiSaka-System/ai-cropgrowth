@@ -26,7 +26,8 @@ DIRECT = ("areas", "plan", "periodic", "recent", "quick-check", "outputs")
 
 # flag -> RunConfig field
 SETTINGS = {
-    "--vector-path": ("vector_path", str), "--prov-col": ("prov_col", str),
+    "--vector-path": ("vector_path", str), "--vector-layer": ("vector_layer", str),
+    "--prov-col": ("prov_col", str),
     "--region-col": ("region_col", str), "--plant-mo-col": ("plant_mo_col", str),
     "--aoi-path": ("aoi_path", str), "--aoi-name-col": ("aoi_name_col", str),
     "--data-source": ("data_source", str), "--resolution": ("resolution_m", float),

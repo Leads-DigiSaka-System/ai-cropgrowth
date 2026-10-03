@@ -146,6 +146,14 @@ def default_season_year(season, today=None):
     return t.year
 
 
+def season_window_for_months(months, season, season_year):
+    """One window covering several planting months of a season (e.g. a province
+    whose municipalities plant in Oct, Nov and Dec): from 1 month before the
+    earliest planting to 6 months after the latest. Returns (start, end, earliest_month)."""
+    wins = sorted((dp.season_window(m, planting_year(m, season, season_year)), m) for m in months)
+    return wins[0][0][0], max(w[1] for w, _ in wins), wins[0][1]
+
+
 def season_label(season, season_year):
     return f"{season}{season_year}"
 
@@ -212,10 +220,10 @@ def _cfg_tag(cfg):
 # ==================================================================
 # PERIODIC mode (national / regional / provincial)
 # ==================================================================
-def periodic_window(planting_month, year, as_of):
-    """Season window of (planting_month, year) clipped at as_of, or None if
-    the season has not started by as_of."""
-    s, e = dp.season_window(planting_month, year)
+def periodic_window(planting_month, year, as_of, window=None):
+    """Season window of (planting_month, year) — or the given (start, end) —
+    clipped at as_of; None if the season has not started by as_of."""
+    s, e = window or dp.season_window(planting_month, year)
     as_of = pd.Timestamp(as_of).normalize()
     if as_of < pd.Timestamp(s):
         return None
@@ -224,14 +232,16 @@ def periodic_window(planting_month, year, as_of):
 
 def run_periodic_unit(area, planting_month, year, as_of, tile_deg=0.25,
                       pheno_cfg=None, cache_dir=None, tile_workers=1,
-                      date_median_radius=1):
+                      date_median_radius=1, window=None):
     """
     Season phenology for one admin unit (province) with data up to as_of.
     Returns the phenology Dataset clipped to the unit, or None (season not
     started / no coverage). attrs['season_start'/'season_end'] keep the full
     season window for listing its periods.
+    window : (start, end) season window to use instead of season_window(planting_month,
+             year), e.g. one covering several planting months (season_window_for_months).
     """
-    win = periodic_window(planting_month, year, as_of)
+    win = periodic_window(planting_month, year, as_of, window)
     if win is None:
         return None
     geom, bbox = _geometry_and_bbox(area)
@@ -245,7 +255,7 @@ def run_periodic_unit(area, planting_month, year, as_of, tile_deg=0.25,
         return None
     pheno = ph.smooth_dates(pheno, date_median_radius)
     pheno = dp.clip_to_geometry(pheno, geom)
-    s, e = dp.season_window(planting_month, year)
+    s, e = window or dp.season_window(planting_month, year)
     pheno.attrs.update(season_start=s, season_end=e, as_of=str(pd.Timestamp(as_of).date()))
     return pheno
 

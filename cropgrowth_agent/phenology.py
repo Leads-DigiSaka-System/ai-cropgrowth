@@ -108,6 +108,13 @@ DEFAULTS = dict(
     MIN_PEAK_NDVI       = 0.50,
     MAX_BASE_NDVI       = 0.45,       # perennial / tree cover never drops this low
     SEASON_LEN_DAYS     = (50, 180),  # emergence -> harvest plausible range
+    PEAK_CONFIRM_FRAC   = 0.10,       # a peak counts only once NDVI_s has fallen this fraction of the
+                                      #   amplitude after it (in observed data); otherwise the crop is
+                                      #   still at / before its peak (QC 2) — no peak, maturity, harvest
+    MIN_FALL_FRAC       = 0.40,       # BASE_MODE='separate': the post-peak trough is used as the falling
+                                      #   base only if NDVI fell at least this fraction of the amplitude;
+                                      #   a shallow "trough" (e.g. just the last observation) is not a
+                                      #   harvest, so the rising base is used instead
     DESPIKE_DROP        = 0.15,       # drop single dips this far below neighbour mean ...
     DESPIKE_MIN_NEIGHBOR= 0.40,       # ... only when BOTH neighbours are vegetated
                                       #     (protects the genuine flooded-paddy trough)
@@ -129,7 +136,7 @@ QC_HIGH_BASE       = 14
 QC_NO_RISE         = 15   # no rising 15 % crossing before the peak
 QC_BAD_LENGTH      = 16   # season length outside SEASON_LEN_DAYS
 QC_DESCRIPTION = {
-    0: "complete cycle", 1: "ongoing, past peak", 2: "ongoing, before peak",
+    0: "complete cycle", 1: "ongoing, past peak", 2: "ongoing, before / at peak (peak not confirmed)",
     10: "too few clear observations", 11: "no interior peak",
     12: "amplitude too small", 13: "peak NDVI too low", 14: "base NDVI too high",
     15: "no rising 15% crossing", 16: "season length implausible",
@@ -364,6 +371,13 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
         base_rise = np.where(has_r, np.minimum(vmin_l, vmin_r), vmin_l)
         base_fall = base_rise
     amp = vmax - base_rise
+    # the decline seen after the peak, in observed data only
+    fall_amp = np.where(has_r, vmax - vmin_r, 0.0)
+    # a shallow post-peak "trough" (data ends near the top) is not a harvest base
+    base_fall = np.where(fall_amp < c["MIN_FALL_FRAC"] * amp, base_rise, base_fall)
+    # peak confirmed only once NDVI has visibly turned down after it; otherwise the
+    # crop is still at / before its peak and peak, maturity and harvest stay undefined
+    pre_peak = pre_peak | (is_peak & (fall_amp < c["PEAK_CONFIRM_FRAC"] * amp))
     thr_rise = base_rise + c["THRESHOLD_FRAC"] * (vmax - base_rise)
     thr_fall = base_fall + c["THRESHOLD_FRAC"] * (vmax - base_fall)
     thr_head = base_rise + c["HEADING_NORM"] * (vmax - base_rise)
@@ -387,6 +401,9 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     P = S if c["PLANT_FROM"] == "smoothed" else F          # SG rounds the sharp flood trough
     i_plant = _masked_argmin(P, _range_mask(T, l_lo, j))
     d_plant = t[i_plant] + _parabolic_offset(P, i_plant) * dt
+    # trough at the very first observation: NDVI may have been lower before the data
+    # starts, so the planting date is not observed
+    plant_ok = i_plant > first_obs
 
     # ---- peak date --------------------------------------------------------
     d_peak = t[ip] + _parabolic_offset(S, ip) * dt
@@ -396,22 +413,27 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     i_pi = _masked_argmax(G, _range_mask(T, pi_lo, np.maximum(pi_hi, pi_lo)))
     d_pi = t[i_pi] + _parabolic_offset(G, i_pi) * dt
     pi_valid = ~pre_peak | (i_pi < ip - 1)                  # growth rate already turned down
+    # the maximum growth rate must be inside the rising limb, not on its first or last
+    # step: at an edge the true maximum may lie outside the data
+    pi_valid &= (i_pi > pi_lo) & (i_pi < pi_hi)
 
     # ---- tillering: onset of rapid increase = max acceleration ----------
     if c["TILLER_RULE"] == "norm":                          # calibratable level crossing
         thr_til = base_rise + c["TILLER_NORM"] * (vmax - base_rise)
         below_t = (S < thr_til[None, :]) & (idx < ip[None, :]) & (idx >= j[None, :])
         jt = T - 1 - np.argmax(below_t[::-1], axis=0)
-        d_til = np.where(below_t.any(0), _crossing_time(S, jt, thr_til, t, dt), d_emerg)
+        til_ok = below_t.any(0)
+        d_til = _crossing_time(S, jt, thr_til, t, dt)
     else:                                                   # max acceleration (G' peak)
         i_til = _masked_argmax(G2, _range_mask(T, j, np.maximum(i_pi, j)))
         d_til = t[i_til] + _parabolic_offset(G2, i_til) * dt
+        til_ok = (i_til > j) & (i_til < i_pi) & pi_valid    # interior, as for PI
 
     # ---- heading: NDVI_norm reaches HEADING_NORM (approaching max) ------
     below_h = (S < thr_head[None, :]) & (idx < ip[None, :]) & (idx >= j[None, :])
     has_h = below_h.any(0)
     jh = T - 1 - np.argmax(below_h[::-1], axis=0)
-    d_head = np.where(has_h, _crossing_time(S, jh, thr_head, t, dt), d_peak)
+    d_head = _crossing_time(S, jh, thr_head, t, dt)         # only when the crossing is observed
 
     # ---- harvest: first falling NDVI_15 crossing after the peak ---------
     fall = (S <= thr_fall[None, :]) & (idx > ip[None, :]) & (idx <= last_obs[None, :])
@@ -428,13 +450,18 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     # only a real maturity onset if the decline has actually steepened then eased
     # (or harvest seen); otherwise leave undefined for an ongoing cycle
     has_m &= has_harv | (i_mat < m_hi)
+    has_m &= fall_amp >= c["MIN_FALL_FRAC"] * amp           # a real decline, not a wobble at the top
 
-    # ---- enforce chronological order -----------------------------------
-    d_plant = np.minimum(d_plant, d_emerg)
-    d_til = np.clip(d_til, d_emerg, np.where(pi_valid, d_pi, np.inf))
-    d_pi = np.maximum(d_pi, d_til)
-    d_head = np.clip(d_head, np.where(pi_valid, d_pi, d_til), d_peak)
-    d_mat = np.clip(d_mat, d_peak, np.where(has_harv, d_harv, np.inf))
+    # ---- chronological order: a date that contradicts its neighbours is
+    # dropped (left undefined), never moved onto them -------------------
+    plant_ok &= d_plant <= d_emerg
+    til_ok &= d_til >= d_emerg
+    pi_valid &= d_pi >= d_emerg
+    til_ok &= ~pi_valid | (d_til <= d_pi)
+    head_ok = has_h & ~pre_peak & (d_head <= d_peak)
+    head_ok &= ~pi_valid | (d_head >= d_pi)
+    has_m &= d_mat >= d_peak
+    has_m &= ~has_harv | (d_mat <= d_harv)
 
     season = d_harv - d_emerg
     lo_len, hi_len = c["SEASON_LEN_DAYS"]
@@ -447,11 +474,11 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     def put(name, val, cond=True):
         out[name] = np.where(live & cond, val, np.nan).astype(np.float32)
 
-    put("plant", d_plant)
+    put("plant", d_plant, plant_ok)
     put("emergence", d_emerg)
-    put("tillering", d_til)
+    put("tillering", d_til, til_ok)
     put("panicle_init", d_pi, pi_valid)
-    put("heading", d_head, ~pre_peak)
+    put("heading", d_head, head_ok)
     put("peak", d_peak, ~pre_peak)
     put("maturity", d_mat, has_m)
     put("harvest", d_harv, has_harv)
