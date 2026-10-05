@@ -60,6 +60,10 @@ class LocalStore:
         with open(self._full(rel), encoding="utf-8") as fh:
             return fh.read()
 
+    def get(self, rel, local_dir):
+        """Local path of a stored file (no copy needed for a folder store)."""
+        return self._full(rel)
+
     def refresh(self, prefix=""):
         pass
 
@@ -118,6 +122,13 @@ class GCSStore:
     def read_text(self, rel):
         return self.bucket.blob(rel.lstrip("/")).download_as_text()
 
+    def get(self, rel, local_dir):
+        """Download to local_dir and return the local path."""
+        os.makedirs(local_dir, exist_ok=True)
+        local = os.path.join(local_dir, os.path.basename(rel))
+        self.bucket.blob(rel.lstrip("/")).download_to_filename(local)
+        return local
+
     def describe(self):
         return f"gcs:gs://{self.bucket_name}"
 
@@ -149,6 +160,12 @@ class MultiStore:
 
     def read_text(self, rel):
         return self.stores[0].read_text(rel)
+
+    def get(self, rel, local_dir):
+        for st in self.stores:                       # a local copy first, if there is one
+            if isinstance(st, LocalStore):
+                return st.get(rel, local_dir)
+        return self.stores[0].get(rel, local_dir)
 
     def refresh(self, prefix=""):
         for s in self.stores:

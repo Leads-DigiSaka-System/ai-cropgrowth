@@ -20,6 +20,8 @@ def test_areas_and_plan(runner):
     assert runner.list_areas("region") == ["R1", "R4"]
     plan = runner.plan_periodic("regional", ["r1"], "2026-04-01")
     assert plan["provinces"] == 2 and plan["detail"][0]["periods"] == ["202603"]
+    assert "PALAWAN" in list(runner.select("national")["Pro_Name"])          # no default exclusion
+    runner.update(exclude=("PALAWAN",))
     assert "PALAWAN" not in list(runner.select("national")["Pro_Name"])
 
 

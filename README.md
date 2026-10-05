@@ -18,6 +18,8 @@ products/growth_stage/2026/dry/                    provincial / regional / natio
 ├── dry2026_BULACAN_202609.tiff                    monthly (…_202609H1 / H2 when semimonthly)
 ├── summary/dry2026_BULACAN_202609.csv             hectares per stage
 ├── qa/dry2026_BULACAN_phenology_dates.tiff        optional: the 8 transition dates + QC bands
+├── mosaic/dry2026_PHILIPPINES_202609.tiff         all provinces of the run in one COG (regional: _REGION_III_)
+├── mosaic/dry2026_PHILIPPINES_202609_summary.csv  hectares per stage for the whole mosaic
 └── runs/periodic_<timestamp>.csv
 ```
 
@@ -128,6 +130,25 @@ moved onto a neighbouring date to fill a gap.
 - **Order:** a date out of order with its neighbours is dropped.
 - **"Complete cycle" (QC 0):** means the harvest was observed.
 
+### Large provinces and mosaics
+
+- **Provinces are written tile by tile to disk.** Each tile is classified and clipped, then written into a sparse
+  GeoTIFF on disk. The compressed COG is built from it at the end, so memory stays at about one tile per worker
+  whatever the province's size. Before, a province was assembled in memory with every phenology band, which ran
+  out of memory on big provinces like Palawan.
+- **One global pixel grid:** every product sits on the same 30 m grid, with pixel edges at multiples of the
+  pixel size, so provinces fit together exactly.
+- **Automatic mosaic:** after a national, regional or multi-province run (`mosaic_after=True`), the province maps
+  are merged into **one COG per period**: `mosaic/<label>_PHILIPPINES_<period>.tiff`, or `_<REGION>_` for a
+  regional run. A hectares-per-stage CSV is saved with it.
+  - The merge reads the inputs block by block, so the whole country at 30 m (about 36 000 × 61 000 px) needs
+    little memory.
+  - The output is a tiled, DEFLATE-compressed COG with internal overviews.
+- **Rebuilding a mosaic:** use `runner.mosaic_periodic(level, names, as_of, periods=[...])`, the agent's
+  `mosaic_periodic`, or `python -m cropgrowth_agent mosaic`, e.g. after retrying failed provinces. Provinces
+  still missing a map are listed.
+- **No province is excluded by default.** Set `exclude` to skip some.
+
 ### Data sources
 
 | | **`hls`** (default): Harmonized Landsat Sentinel-2 v2.0 | **`s2`**: Sentinel-2 L2A |
@@ -191,6 +212,7 @@ python -m cropgrowth_agent --config config.json --chat
 python -m cropgrowth_agent areas       --config config.json --kind region
 python -m cropgrowth_agent plan        --config config.json --level regional --names "REGION III"
 python -m cropgrowth_agent periodic    --config config.json --level provincial --names BULACAN --as-of 2026-10-01
+python -m cropgrowth_agent mosaic      --config config.json --level national --labels 202609
 python -m cropgrowth_agent recent      --config config.json --names "SCIENCE CITY OF MUÑOZ"
 python -m cropgrowth_agent quick-check --config config.json --bbox 120.90 15.60 120.93 15.63 --planting-month 12
 python -m cropgrowth_agent outputs     --config config.json --kind periodic
@@ -227,6 +249,8 @@ python -m cropgrowth_agent outputs     --config config.json --kind periodic
 | `pheno_cfg` | see `runner.DEFAULT_PHENO_CFG` | Phenology thresholds (all in `phenology.DEFAULTS`) |
 | `tile_workers` | 2 | Tiles in parallel |
 | `tile_cache_dir` | none | Resume cache for interrupted provinces |
+| `mosaic_after` | true | After a multi-province periodic run, one mosaic COG per period |
+| `exclude` | none | Provinces to skip (name contains), e.g. `["PALAWAN"]` |
 
 Python, without the CLI:
 

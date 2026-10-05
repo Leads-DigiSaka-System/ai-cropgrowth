@@ -29,6 +29,7 @@ from . import data_processing as dp
 from . import phenology as ph
 from . import pipeline as pl
 from . import output_store as storage
+from .mosaic import GridWriter, mosaic_cogs
 
 DEFAULT_PHENO_CFG = dict(
     THRESHOLD_FRAC=0.15, BASE_MODE="separate", SG_WINDOW=5, SG_POLYORDER=2,
@@ -67,12 +68,14 @@ class RunConfig:
     season: str = None
     season_year: int = None
     year: int = None
-    exclude: tuple = ("PALAWAN",)
+    exclude: tuple = ()                    # provinces to skip (substring match), e.g. ("PALAWAN",)
     planting_month_fallback: int = None    # None -> 12 (dry) / 6 (wet)
     cadence: str = "monthly"               # 'monthly' | 'semimonthly'
     periods: str = "last_complete"         # 'last_complete' | 'current' | 'season'
     stage_method: str = "dominant"         # 'dominant' | 'midpoint'
     save_phenology_bands: bool = False
+    mosaic_after: bool = True              # after a periodic run, mosaic the provinces into one COG
+                                           #   per period (national / regional / multi-province runs)
     cog_label: str = None                  # None -> '<season><season_year>', e.g. 'wet2026'
     output_prefix: str = None              # None -> 'products/growth_stage/<season_year>/<season>'
 
@@ -482,11 +485,156 @@ class Runner:
             shutil.rmtree(tmp, ignore_errors=True)
         return out
 
+    def stream_province(self, units, prov, as_of, periods):
+        """
+        Province products without holding the province in memory (needed for large ones such
+        as Palawan). Each finished tile is smoothed, clipped to the province outline, classified
+        into a stage map per period and written straight into a disk-backed raster on the
+        global grid (mosaic.GridWriter); the COGs are built from those at the end.
+        Peak memory: one tile (per worker). Returns the same list as save_periodic, or None
+        when no tile had data.
+        """
+        c = self.cfg
+        sub = units.loc[units[c.prov_col] == prov]
+        info = self._planting(units, prov)
+        pm = info["pm"]
+        win = pl.periodic_window(pm, c.planting_year(pm), as_of, info["window"])
+        if win is None:
+            return None
+        bbox = tuple(float(v) for v in sub.total_bounds)
+        res = dp.GRID_SCALE_DEG
+        tags = {"province": prov, "season": c.label(), "window": f"{win[0]}..{win[1]}",
+                "classes": "; ".join(f"{k}={v}" for k, v in ph.STAGE_CLASSES.items()),
+                "method": c.stage_method, "data_source": c.data_source}
+        writers = {p.label: GridWriter(bbox, res, 1, "int16", ph.STAGE_NODATA,
+                                       band_names=[f"growth_stage {p.label}"],
+                                       tags={**tags, "period": p.label,
+                                             "period_dates": f"{p.start.date()}..{p.end.date()}"})
+                   for p in periods}
+        qa = (GridWriter(bbox, res, len(ph.QA_BANDS), "int16", ph.QA_NODATA, band_names=ph.QA_BANDS,
+                         tags={**tags, **ph.qa_tags(c.ref_year(), f"{win[0]}..{win[1]}")})
+              if c.save_phenology_bands else None)
+        all_writers = list(writers.values()) + ([qa] if qa else [])
+        pcfg = dict(c.pheno_cfg)
+
+        def sink(t, tb):
+            w, s_, e, n = tb                         # each pixel belongs to exactly one tile
+            t = t.isel(x=np.where((t.x.values >= w) & (t.x.values < e))[0],
+                       y=np.where((t.y.values > s_) & (t.y.values <= n))[0])
+            if t.sizes["x"] == 0 or t.sizes["y"] == 0:
+                return
+            t = ph.smooth_dates(t, c.date_median_radius)
+            t = dp.clip_to_geometry(t, sub, drop=False)
+            ys, xs = t["y"].values, t["x"].values
+            for p in periods:
+                st = ph.classify_stage_period(t, p.start, p.end, c.stage_method)
+                if c.stage_majority_radius:
+                    st = st.copy(data=ph.majority_filter(st.values, c.stage_majority_radius))
+                writers[p.label].write(st.values, ys, xs)
+            if qa is not None:
+                qa.write(ph.encode_qa_bands(t, c.ref_year()), ys, xs)
+
+        cache = os.path.join(c.tile_cache_dir, _fname(prov)) if c.tile_cache_dir else None
+        tmp = tempfile.mkdtemp(prefix="cropgrowth_")
+        try:
+            done = dp.build_province_datacube_tiled(
+                bbox, pm, c.planting_year(pm), tile_deg=c.effective_tile_deg(), geometry=sub,
+                cache_dir=cache, tile_workers=c.tile_workers, window=win,
+                cache_tag=pl._cfg_tag(pcfg), per_tile_fn=lambda ds: ph.run_phenology(ds, **pcfg),
+                tile_sink=sink)
+            if done is None:
+                return None
+            out = []
+            for p in periods:
+                local = os.path.join(tmp, os.path.basename(self._stage_rel(prov, p)))
+                writers[p.label].to_cog(local)
+                uri = self.store.put(local, self._stage_rel(prov, p))
+                summ = pl.summary_from_counts(pl.stage_counts_from_raster(local))
+                csv = os.path.join(tmp, os.path.basename(self._summary_rel(prov, p)))
+                summ.to_csv(csv, index=False)
+                self.store.put(csv, self._summary_rel(prov, p))
+                os.remove(local)
+                out.append({"period": p.label, "uri": uri,
+                            "hectares": {r["name"]: r["hectares"] for _, r in summ.iterrows()
+                                         if r["hectares"] > 0}})
+            if qa is not None:
+                local = os.path.join(tmp, os.path.basename(self._qa_rel(prov)))
+                qa.to_cog(local)
+                self.store.put(local, self._qa_rel(prov))
+            return out
+        finally:
+            for wr in all_writers:
+                wr.discard()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ------------------------------------------------------------ mosaics
+    def _mosaic_rel(self, scope, label, ext=".tiff"):
+        c = self.cfg
+        return f"{c.prefix()}/mosaic/{c.label()}_{_fname(scope)}_{label}{ext}"
+
+    @staticmethod
+    def _scope_name(level, names):
+        if level == "national":
+            return "PHILIPPINES"
+        names = [_key(n) for n in (names or [])]
+        return "_".join(names) if 0 < len(names) <= 3 else f"{level.upper()}_{len(names)}"
+
+    def mosaic_periodic(self, level="national", names=None, as_of=None, periods=None, scope=None):
+        """
+        Merge the saved province stage maps into one COG per period for the selection
+        (national -> PHILIPPINES), plus its hectares-per-stage CSV, under <prefix>/mosaic/.
+        periods: labels like '202609' / '202609H1'; default: the periods a run on as_of makes.
+        Reads province COGs block by block (works for the whole country at 30 m).
+        Returns {'mosaics': [...], 'missing': {period: [provinces]}}.
+        """
+        c = self.cfg
+        as_of = self._as_of(as_of)
+        units = self.select(level, names)
+        provs = sorted(units[c.prov_col])
+        scope = scope or self._scope_name(level, names)
+        expected = {}                                     # period label -> provinces in season
+        for prov in provs:
+            for p in self.periods_for(self._planting(units, prov)["window"], as_of):
+                expected.setdefault(p.label, []).append(prov)
+        labels = list(periods) if periods else sorted(expected)
+        self.store.refresh(c.prefix() + "/")
+        out = {"scope": scope, "mosaics": [], "missing": {}}
+        for label in labels:
+            p = pl.Period(None, None, label)
+            have = [prov for prov in provs if self.store.exists(self._stage_rel(prov, p))]
+            missing = sorted(set(expected.get(label, [])) - set(have))
+            if missing:
+                out["missing"][label] = missing
+            if not have:
+                self.log(f"  mosaic {label}: no province maps saved yet")
+                continue
+            tmp = tempfile.mkdtemp(prefix="cropgrowth_mosaic_")
+            try:
+                local_in = [self.store.get(self._stage_rel(prov, p), tmp) for prov in have]
+                local_out = os.path.join(tmp, os.path.basename(self._mosaic_rel(scope, label)))
+                self.log(f"  mosaic {label}: {len(have)} province map(s) -> {scope}")
+                info = mosaic_cogs(local_in, local_out, nodata=ph.STAGE_NODATA, log=self.log)
+                uri = self.store.put(local_out, self._mosaic_rel(scope, label))
+                summ = pl.summary_from_counts(pl.stage_counts_from_raster(local_out))
+                csv = os.path.join(tmp, "summary.csv")
+                summ.to_csv(csv, index=False)
+                self.store.put(csv, self._mosaic_rel(scope, label, "_summary.csv"))
+                out["mosaics"].append({
+                    "period": label, "uri": uri, "provinces": len(have),
+                    "size_px": [info["width"], info["height"]],
+                    "hectares": {r["name"]: r["hectares"] for _, r in summ.iterrows() if r["hectares"] > 0}})
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        return out
+
     def run_periodic(self, level="national", names=None, as_of=None, skip_existing=True,
-                     start_from=None, only=None):
+                     start_from=None, only=None, mosaic=None):
         """
         Process the selected provinces and save one stage map per period.
-        only : restrict to these province names (e.g. retrying failures).
+        Provinces are streamed to disk tile by tile (stream_province), so any size fits in memory.
+        only   : restrict to these province names (e.g. retrying failures).
+        mosaic : afterwards merge the provinces into one COG per period (mosaic_periodic);
+                 default cfg.mosaic_after, and only for runs over more than one province.
         Returns {'success': [...], 'skipped', 'out_of_season', 'no_coverage', 'failed'}.
         """
         from .data_processing import tqdm
@@ -512,14 +660,12 @@ class Runner:
                 res["skipped"].append(prov); self.log(f"  {prov}: skipped (exists)"); continue
             t0 = time.time()
             try:
-                pheno = self.process_province(units, prov, as_of)
-                if pheno is None:
+                maps = self.stream_province(units, prov, as_of, ps)
+                if maps is None:
                     res["no_coverage"].append(prov); self.log(f"  {prov}: no coverage"); continue
-                maps = self.save_periodic(pheno, prov, ps)
                 res["success"].append({"province": prov, "minutes": round((time.time() - t0) / 60, 1),
                                        "maps": maps})
                 self.log(f"  {prov}: ok ({(time.time() - t0) / 60:.1f} min) -> {len(maps)} map(s)")
-                del pheno
             except Exception as e:
                 res["failed"].append({"province": prov, "error": repr(e)[:500]})
                 self.log(f"  {prov}: ERROR {e!r}")
@@ -527,6 +673,14 @@ class Runner:
             finally:
                 gc.collect()
         self.log(" | ".join(f"{k} {len(v)}" for k, v in res.items() if isinstance(v, list)))
+        do_mosaic = self.cfg.mosaic_after if mosaic is None else mosaic
+        if do_mosaic and len(units) > 1 and (res["success"] or res["skipped"]) and not only:
+            try:
+                res["mosaic"] = self.mosaic_periodic(level, names, as_of)
+            except Exception as e:                              # maps are saved; report and go on
+                res["mosaic"] = {"error": repr(e)[:500]}
+                self.log(f"  mosaic: ERROR {e!r}")
+                traceback.print_exc()
         self._save_run_log(res, "periodic")
         self.last_periodic = res
         return res
