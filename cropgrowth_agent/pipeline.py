@@ -312,20 +312,53 @@ def run_recent(area, as_of=None, lookback_days=RECENT_LOOKBACK_DAYS, tile_deg=0.
     return ph.recent_stage(pheno, as_of), pheno
 
 
-def stage_area_summary(stage):
-    """Pixels, hectares and share of mapped cropland per stage class for a
-    stage DataArray (int16, -1 = nodata). Pixel area follows latitude."""
+def stage_area_counts(stage, counts=None):
+    """Add a stage map's pixels and hectares per class to `counts`
+    ({code: [pixels, hectares]}); pixel area follows latitude. Counts from tiles or
+    provinces can be summed this way without holding the whole map."""
+    counts = counts if counts is not None else {code: [0, 0.0] for code in ph.STAGE_CLASSES}
     a = np.asarray(stage.values)
     res = dp.GRID_SCALE_DEG
     lat = np.asarray(stage["y"].values, dtype=float)
     px_ha = (res * dp.M_PER_DEG) ** 2 * np.cos(np.radians(lat)) / 1e4   # per row
-    rows = []
-    for code, name in ph.STAGE_CLASSES.items():
+    for code in ph.STAGE_CLASSES:
         m = a == code
-        rows.append({"stage": code, "name": name, "pixels": int(m.sum()),
-                     "hectares": float((m * px_ha[:, None]).sum())})
+        counts[code][0] += int(m.sum())
+        counts[code][1] += float((m * px_ha[:, None]).sum())
+    return counts
+
+
+def stage_counts_from_raster(path, counts=None):
+    """stage_area_counts for a stage GeoTIFF / COG, read block by block (any size);
+    pixel size and latitudes come from the file."""
+    import rasterio
+    counts = counts if counts is not None else {code: [0, 0.0] for code in ph.STAGE_CLASSES}
+    with rasterio.open(path) as src:
+        t = src.transform
+        px_m2 = abs(t.a) * dp.M_PER_DEG * abs(t.e) * dp.M_PER_DEG
+        for _, win in src.block_windows(1):
+            a = src.read(1, window=win)
+            lat = t.f + (win.row_off + np.arange(win.height) + 0.5) * t.e
+            ha = px_m2 * np.cos(np.radians(lat)) / 1e4
+            for code in ph.STAGE_CLASSES:
+                m = a == code
+                if m.any():
+                    counts[code][0] += int(m.sum())
+                    counts[code][1] += float((m * ha[:, None]).sum())
+    return counts
+
+
+def summary_from_counts(counts):
+    rows = [{"stage": code, "name": name, "pixels": int(counts[code][0]),
+             "hectares": float(counts[code][1])} for code, name in ph.STAGE_CLASSES.items()]
     df = pd.DataFrame(rows)
     total = df["hectares"].sum()
     df["share_%"] = (100 * df["hectares"] / total).round(1) if total else 0.0
     df["hectares"] = df["hectares"].round(1)
     return df
+
+
+def stage_area_summary(stage):
+    """Pixels, hectares and share of mapped cropland per stage class for a
+    stage DataArray (int16, -1 = nodata). Pixel area follows latitude."""
+    return summary_from_counts(stage_area_counts(stage))

@@ -726,7 +726,37 @@ def to_doy(ds_days, ref_year):
     return ds_days - ref + 1
 
 
-def write_cog(ds, path, ref_year, bands=None, nodata=-32768):
+QA_BANDS = DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max", "ndvi15", "qc", "n_obs", "max_gap_days"]
+QA_NODATA = -32768
+
+
+def encode_qa_bands(ds, ref_year, bands=None, nodata=QA_NODATA):
+    """Phenology products -> int16 (bands, y, x): dates as DOY relative to Jan 1 of
+    ref_year, ndvi_* x 10000, others rounded; NaN -> nodata."""
+    bands = bands or QA_BANDS
+    first = ds[bands[0]]
+    data = np.empty((len(bands),) + first.shape, np.int16)
+    for i, b in enumerate(bands):
+        v = ds[b].values.astype(np.float64)
+        if b in DATE_BANDS:
+            v = to_doy(v, ref_year)
+        elif b.startswith("ndvi"):
+            v = v * 10000.0
+        v = np.where(np.isfinite(v), np.clip(np.round(v), -32767, 32767), nodata)
+        data[i] = v.astype(np.int16)
+    return data
+
+
+def qa_tags(ref_year, window=""):
+    return dict(date_encoding=f"day of year relative to {ref_year}-01-01 (1 = Jan 1; "
+                              f"<=0 previous year, >365 next year)",
+                ndvi_encoding="NDVI x 10000",
+                qc_codes="; ".join(f"{k}={v}" for k, v in QC_DESCRIPTION.items()),
+                window=window,
+                method="NDVI, SG smoothing, 15% amplitude threshold + derivatives")
+
+
+def write_cog(ds, path, ref_year, bands=None, nodata=QA_NODATA):
     """
     Write phenology products as one int16 COG.
       date bands  -> DOY relative to Jan 1 of ref_year (see to_doy)
@@ -739,8 +769,7 @@ def write_cog(ds, path, ref_year, bands=None, nodata=-32768):
     from rasterio.shutil import copy as rio_copy
     from rasterio.transform import from_origin
 
-    bands = bands or (DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max",
-                                    "ndvi15", "qc", "n_obs", "max_gap_days"])
+    bands = bands or QA_BANDS
     y_dim, x_dim = ds.attrs.get("spatial_dims", ["y", "x"])
     if ds[y_dim].values[0] < ds[y_dim].values[-1]:
         ds = ds.sortby(y_dim, ascending=False)
@@ -748,15 +777,7 @@ def write_cog(ds, path, ref_year, bands=None, nodata=-32768):
     rx, ry = float(abs(xs[1] - xs[0])), float(abs(ys[1] - ys[0]))
     transform = from_origin(xs[0] - rx / 2, ys[0] + ry / 2, rx, ry)
 
-    data = np.empty((len(bands), ys.size, xs.size), np.int16)
-    for i, b in enumerate(bands):
-        v = ds[b].values.astype(np.float64)
-        if b in DATE_BANDS:
-            v = to_doy(v, ref_year)
-        elif b.startswith("ndvi"):
-            v = v * 10000.0
-        v = np.where(np.isfinite(v), np.clip(np.round(v), -32767, 32767), nodata)
-        data[i] = v.astype(np.int16)
+    data = encode_qa_bands(ds, ref_year, bands, nodata)
 
     profile = dict(driver="GTiff", width=xs.size, height=ys.size, count=len(bands),
                    dtype="int16", crs="EPSG:4326", transform=transform,

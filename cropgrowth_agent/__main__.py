@@ -9,6 +9,7 @@
   python -m cropgrowth_agent areas --config config.json --kind region
   python -m cropgrowth_agent plan --config config.json --level regional --names "REGION III"
   python -m cropgrowth_agent periodic --config config.json --level provincial --names BOHOL --as-of 2026-03-01
+  python -m cropgrowth_agent mosaic --config config.json --level national --labels 202609
   python -m cropgrowth_agent recent --config config.json --names "SCIENCE CITY OF MUÑOZ"
   python -m cropgrowth_agent recent --config config.json --bbox 120.90 15.60 120.95 15.65
   python -m cropgrowth_agent quick-check --config config.json --bbox 120.90 15.60 120.93 15.63 --planting-month 12
@@ -22,7 +23,7 @@ import json
 import os
 import sys
 
-DIRECT = ("areas", "plan", "periodic", "recent", "quick-check", "outputs")
+DIRECT = ("areas", "plan", "periodic", "mosaic", "recent", "quick-check", "outputs")
 
 # flag -> RunConfig field
 SETTINGS = {
@@ -85,6 +86,8 @@ def direct(argv):
     p.add_argument("--as-of", help="YYYY-MM-DD (default today)")
     p.add_argument("--only", nargs="+", help="periodic: only these provinces (e.g. retry failures)")
     p.add_argument("--no-skip-existing", action="store_true")
+    p.add_argument("--no-mosaic", action="store_true", help="periodic: don't mosaic afterwards")
+    p.add_argument("--labels", nargs="+", help="mosaic: period labels, e.g. 202609 202609H1")
     p.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     p.add_argument("--planting-month", type=int)
     p.add_argument("--contains")
@@ -95,7 +98,10 @@ def direct(argv):
     elif a.cmd == "plan":
         _print(r.plan_periodic(a.level, a.names, a.as_of))
     elif a.cmd == "periodic":
-        _print(r.run_periodic(a.level, a.names, a.as_of, skip_existing=not a.no_skip_existing, only=a.only))
+        _print(r.run_periodic(a.level, a.names, a.as_of, skip_existing=not a.no_skip_existing, only=a.only,
+                              mosaic=False if a.no_mosaic else None))
+    elif a.cmd == "mosaic":
+        _print(r.mosaic_periodic(a.level, a.names, a.as_of, a.labels))
     elif a.cmd == "recent":
         if not a.names and not a.bbox:
             p.error("recent needs --names or --bbox")

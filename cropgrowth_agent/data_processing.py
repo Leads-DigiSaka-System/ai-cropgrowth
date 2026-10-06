@@ -721,11 +721,10 @@ def generate_tiles(bbox, tile_deg=0.1, geometry=None):
 
 
 def _province_grid_coords(bbox, res=None):
-    res = res or GRID_SCALE_DEG
-    w, s, e, n = bbox
-    xs = np.arange(w + res / 2, e, res)
-    ys = np.arange(n - res / 2, s, -res)
-    return ys, xs
+    """Pixel centres of the global grid (edges at multiples of res) over bbox, so every
+    province lands on the same grid and national mosaics are exact copies."""
+    from .mosaic import grid_coords
+    return grid_coords(bbox, res or GRID_SCALE_DEG)
 
 
 def _mosaic_tiles(pairs, bbox, res=None):
@@ -821,7 +820,7 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                                   per_tile_fn=None, apply_cropland_mask=True,
                                   geometry=None, tile_retries=2, cache_dir=None,
                                   allow_failed_tiles=False, tile_workers=1,
-                                  window=None, align="start", cache_tag=""):
+                                  window=None, align="start", cache_tag="", tile_sink=None):
     """
     Tiled province builder.
 
@@ -848,6 +847,11 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
                   finished tiles stay in cache_dir). True -> mosaic what
                   succeeded and leave failed tiles NaN.
     window / align : see build_province_datacube.
+    tile_sink   : fn(tile_ds, tile_bbox) called with each finished tile (after per_tile_fn, from
+                  the main thread) INSTEAD of keeping it for an in-memory mosaic — e.g. writing
+                  stage maps straight to disk. Peak memory then stays at one tile per worker
+                  for any province size. Returns {'tiles_with_data', 'failed_tiles', 'attrs'}
+                  (None when no tile had data) instead of a Dataset.
     tile_workers: tiles processed in parallel threads (reads are I/O bound).
                   Peak memory scales with it: ~1-1.5 GB per worker at
                   tile_deg=0.1, so 2-3 is a safe range on standard Colab.
@@ -935,7 +939,11 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
             failed.append((tb, err))
         elif ds_t is not None:
             attrs = dict(ds_t.attrs) or attrs
-            pairs.append((ds_t, tb))
+            if tile_sink is not None:
+                tile_sink(ds_t, tb)
+                pairs.append((None, tb))                 # count only; the data is not kept
+            else:
+                pairs.append((ds_t, tb))
 
     bar = tqdm(total=len(tiles), desc="tiles", unit="tile")
     if tile_workers and tile_workers > 1:
@@ -956,6 +964,10 @@ def build_province_datacube_tiled(bbox, planting_month, year, tile_deg=0.1,
         raise RuntimeError(
             f"{len(failed)}/{len(tiles)} tile(s) failed (first: {failed[0][1]})"
             + ("; finished tiles are cached and will be reused on rerun" if cache_dir else ""))
+    if tile_sink is not None:
+        if not pairs:
+            return None
+        return {"tiles_with_data": len(pairs), "failed_tiles": len(failed), "attrs": attrs}
     ds = _mosaic_tiles(pairs, bbox)
     if ds is not None:
         for k, v in attrs.items():

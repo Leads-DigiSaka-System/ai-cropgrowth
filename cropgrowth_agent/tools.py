@@ -100,6 +100,17 @@ TOOLS = [
                     "sources, outputs. Use for questions about the method, not to run it.",
      "parameters": {"type": "object", "properties": {
          "query": _STR, "k": {"type": "integer"}}, "required": ["query"]}},
+    {"name": "mosaic_periodic",
+     "description": "Merge the saved province stage maps into one COG per period for national / "
+                    "regional / several provinces, plus hectares per stage. run_periodic already "
+                    "does this after a multi-province run; use it to (re)build mosaics, e.g. after "
+                    "retrying failed provinces.",
+     "parameters": {"type": "object", "properties": {
+         "level": {"type": "string", "enum": list(pl.LEVELS)},
+         "names": _STRS, "as_of": _DATE,
+         "periods": {**_STRS, "description": "period labels like 202609 or 202609H1; default: "
+                                             "the periods a run on as_of makes"}},
+         "required": ["level"]}},
     {"name": "last_run",
      "description": "Result of the last periodic or recent run in this session (successes, "
                     "failures with errors, outputs).",
@@ -212,7 +223,12 @@ class ToolRunner:
                "counts": {k: len(v) for k, v in res.items() if isinstance(v, list)}}
         for k in ("success", "failed", "no_coverage", "out_of_season", "skipped"):
             out[k] = res[k][:60]                         # keep the reply within the context budget
+        if "mosaic" in res:
+            out["mosaic"] = res["mosaic"]
         return out
+
+    def t_mosaic_periodic(self, level, names=None, as_of=None, periods=None):
+        return self.runner.mosaic_periodic(level, names, as_of, periods)
 
     def t_run_recent(self, names=None, bbox=None, as_of=None, lookback_days=None):
         if not names and not bbox:
