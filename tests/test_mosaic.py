@@ -100,7 +100,8 @@ def test_streamed_province_matches_in_memory(runner):
     assert np.array_equal(disk, ref)
     qa = runner.list_outputs("periodic", "phenology_dates")["files"]
     with rasterio.open(os.path.join(runner.store.root, qa[0])) as q:
-        assert q.count == len(ph.QA_BANDS) and q.descriptions[0] == "plant"
+        assert q.count == len(ph.QA_BANDS_TWO_CYCLES) and q.descriptions[0] == "plant"   # auto: 2 cycles
+        assert q.descriptions[-1] == "prev_qc"
 
 
 def test_national_run_builds_mosaic(runner):
@@ -108,7 +109,7 @@ def test_national_run_builds_mosaic(runner):
     assert len(res["success"]) == 3                             # Palawan included (no default exclusion)
     mz = res["mosaic"]["mosaics"][0]
     assert mz["period"] == "202603" and mz["provinces"] == 3
-    assert os.path.basename(mz["uri"]) == "dry2026_PHILIPPINES_202603.tiff"
+    assert os.path.basename(mz["uri"]) == "rice_PHILIPPINES_202603.tiff"       # auto-season label
     total = {}
     for s in res["success"]:
         for k, v in s["maps"][0]["hectares"].items():

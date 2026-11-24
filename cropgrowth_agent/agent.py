@@ -27,6 +27,9 @@ Products
   Oct-Dec 2025). Each province's window runs from 1 month before its planting month to 6 after.
   A period outside a province's season window is reported as out_of_season — if the user asks for
   months of the other season, switch with update_settings(season=..., season_year=...).
+  Default season 'auto': planting months come from BOTH columns, the window covers every candidate
+  season overlapping the periods, and up to two crop cycles are found per pixel (a dry and a wet
+  crop), so overlapping seasons need no column choice. Files are then labelled 'rice_...'.
 - Recent mode (municipal / barangay areas): the CURRENT growth stage plus how many days old the
   newest cloud-free observation is. Tool: run_recent.
 - Stage classes: {stages}. -1 = not cropland.

@@ -486,6 +486,8 @@ def extract_phenology(X, t_days, window_start_days, cfg=None):
     put("ndvi_min", base_rise)
     put("ndvi_max", vmax)
     put("ndvi15", thr_rise)
+    # pre-peak trough (start of this cycle): where an earlier cycle has to end
+    out["trough"] = np.where(live, t[it_l], np.nan).astype(np.float32)
     out["qc"] = np.where(ok | (qc != QC_NO_DATA), qc, QC_NO_DATA).astype(np.float32)
     return out
 
@@ -521,12 +523,22 @@ def smooth_series(X, cfg=None):
 # ==================================================================
 # Pixelwise run over a datacube  (replaces run_cnnlstm_inference)
 # ==================================================================
-def run_phenology(ds, batch_size=None, **overrides):
+PREV = "prev_"                         # band prefix of the previous crop cycle
+PREV_BANDS = DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max", "ndvi15", "qc"]
+
+
+def run_phenology(ds, batch_size=None, max_cycles=1, **overrides):
     """
     ds : Dataset with NDVI (time, y, x) + attrs window_start.
     Returns a Dataset of (y, x) float32 products (see module docstring).
     Non-crop / masked pixels (all-NaN series) come out NaN everywhere
     (qc = NaN), so they stay nodata rather than "no rice".
+
+    max_cycles=2 : also find the crop cycle BEFORE the latest one (a window that
+        holds e.g. a dry-season and a wet-season crop). The latest cycle is found
+        first (use PEAK_SELECT='last'); the series is then cut at that cycle's
+        starting trough and searched again. The earlier cycle's products are the
+        prev_* bands; stage classification uses both cycles in time order.
     """
     batch_size = batch_size or BATCH_PIXELS
     da = ds[NDVI_BAND]
@@ -541,29 +553,64 @@ def run_phenology(ds, batch_size=None, **overrides):
     names = DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max", "ndvi15",
                           "n_obs", "max_gap_days", "last_obs", "qc"]
     flat = {n: np.full(ny * nx, np.nan, np.float32) for n in names}
+    two = int(max_cycles) >= 2
+    pnames = [PREV + n for n in PREV_BANDS] if two else []
+    flat.update({n: np.full(ny * nx, np.nan, np.float32) for n in pnames})
     cols = np.where(any_obs)[0]
     for s in range(0, cols.size, batch_size):
         cc = cols[s:s + batch_size]
         res = extract_phenology(X[:, cc], t_days, w0, overrides)
         for n in names:
             flat[n][cc] = res[n]
+        if two:
+            cut = res["trough"]
+            go = np.isfinite(cut) & (res["qc"] < 10)
+            if go.any():
+                Xp = X[:, cc[go]].copy()
+                Xp[t_days[:, None] > cut[go][None, :]] = np.nan   # keep only what came before
+                rp = extract_phenology(Xp, t_days, w0, overrides)
+                for n in PREV_BANDS:
+                    flat[PREV + n][cc[go]] = rp[n]
 
-    out = xr.Dataset({n: ((y_dim, x_dim), flat[n].reshape(ny, nx)) for n in names},
+    out = xr.Dataset({n: ((y_dim, x_dim), flat[n].reshape(ny, nx)) for n in names + pnames},
                      coords={y_dim: da[y_dim].values, x_dim: da[x_dim].values})
     out.attrs.update(ds.attrs)
     out.attrs["spatial_dims"] = [y_dim, x_dim]
     out.attrs["date_units"] = "days since 1970-01-01"
     qc = flat["qc"][np.isfinite(flat["qc"])]
     n_rice = int((qc < 10).sum())
-    print(f"  phenology: {n_rice}/{cols.size} crop pixels with a rice cycle "
-          f"({int((qc == 0).sum())} complete, {int((qc == 1).sum())} past peak, "
-          f"{int((qc == 2).sum())} pre-peak)")
+    msg = (f"  phenology: {n_rice}/{cols.size} crop pixels with a rice cycle "
+           f"({int((qc == 0).sum())} complete, {int((qc == 1).sum())} past peak, "
+           f"{int((qc == 2).sum())} pre-peak)")
+    if two:
+        pq = flat[PREV + "qc"]
+        msg += f"; {int((pq < 10).sum())} with an earlier cycle in the window"
+    print(msg)
     return out
 
 
 # ==================================================================
 # Growth-stage map at any date (from the transition-date bands)
 # ==================================================================
+def _stage_events(ds):
+    """Stage-start events [(start array, code)] in time order: the previous cycle's
+    (when the dataset has prev_* bands), then the latest cycle's. Missing dates are +inf
+    (never reached). Before the first event a crop pixel is in stage 1."""
+    def band(name, ok=None):
+        v = ds[name].values
+        good = np.isfinite(v) if ok is None else ok & np.isfinite(v)
+        return np.where(good, v, np.inf)
+    ev = []
+    if PREV + "qc" in ds:
+        pq = ds[PREV + "qc"].values
+        pok = np.isfinite(pq) & (pq < 10)
+        ev += [(band(PREV + b, pok), code) for code, b in STAGE_START_BAND]
+        # the latest cycle's planting ends the earlier cycle's post-harvest stage
+        ev.append((band("plant", pok), 1))
+    ev += [(band(b), code) for code, b in STAGE_START_BAND]
+    return ev
+
+
 def classify_stage(ds, as_of):
     """
     Stage class (see STAGE_CLASSES) of every pixel on date `as_of`, derived
@@ -572,15 +619,13 @@ def classify_stage(ds, as_of):
     """
     t = to_epoch_days(as_of)[0]
     qc = ds["qc"].values
-    D = {b: ds[b].values for b in DATE_BANDS}
-    ge = lambda b: np.isfinite(D[b]) & (t >= D[b])
     stage = np.full(qc.shape, STAGE_NODATA, np.int16)
     has = np.isfinite(qc)
     stage[has] = 0
     rice = has & (qc < 10)
     stage[rice] = 1                                         # pre-planting / transplanting
-    for code, band in STAGE_START_BAND:                     # later stages overwrite earlier
-        stage[rice & ge(band)] = code
+    for start, code in _stage_events(ds):                   # later events overwrite earlier
+        stage[rice & (t >= start)] = code
     out = xr.DataArray(stage, dims=ds["qc"].dims, coords=ds["qc"].coords,
                        name="growth_stage",
                        attrs={"as_of": str(pd.Timestamp(as_of).date()),
@@ -606,10 +651,9 @@ def classify_stage_period(ds, start, end, method="dominant"):
         a, b = to_epoch_days(p0)[0], to_epoch_days(p1)[0]
         qc = ds["qc"].values
         # stage k lasts from its start date to the next stage's start date
-        starts = [np.full(qc.shape, -np.inf)] + [
-            np.where(np.isfinite(ds[band].values), ds[band].values, np.inf)
-            for _, band in STAGE_START_BAND]
-        codes = [1] + [c for c, _ in STAGE_START_BAND]
+        ev = _stage_events(ds)
+        starts = [np.full(qc.shape, -np.inf)] + [e for e, _ in ev]
+        codes = [1] + [c for _, c in ev]
         days = []
         for i in range(len(codes)):
             s = starts[i]
@@ -710,9 +754,12 @@ def smooth_dates(ds, radius=1):
     if not radius:
         return ds
     out = ds.copy()
-    for b in DATE_BANDS:
-        out[b] = (out[b].dims, nan_median_filter(out[b].values, radius))
-    out["season_length"] = out["harvest"] - out["emergence"]
+    for pre in ("", PREV):
+        if pre + "harvest" not in out:
+            continue
+        for b in DATE_BANDS:
+            out[pre + b] = (out[pre + b].dims, nan_median_filter(out[pre + b].values, radius))
+        out[pre + "season_length"] = out[pre + "harvest"] - out[pre + "emergence"]
     return out
 
 
@@ -727,6 +774,7 @@ def to_doy(ds_days, ref_year):
 
 
 QA_BANDS = DATE_BANDS + ["season_length", "ndvi_min", "ndvi_max", "ndvi15", "qc", "n_obs", "max_gap_days"]
+QA_BANDS_TWO_CYCLES = QA_BANDS + [PREV + b for b in DATE_BANDS + ["qc"]]
 QA_NODATA = -32768
 
 
@@ -738,7 +786,7 @@ def encode_qa_bands(ds, ref_year, bands=None, nodata=QA_NODATA):
     data = np.empty((len(bands),) + first.shape, np.int16)
     for i, b in enumerate(bands):
         v = ds[b].values.astype(np.float64)
-        if b in DATE_BANDS:
+        if b in DATE_BANDS or (b.startswith(PREV) and b[len(PREV):] in DATE_BANDS):
             v = to_doy(v, ref_year)
         elif b.startswith("ndvi"):
             v = v * 10000.0

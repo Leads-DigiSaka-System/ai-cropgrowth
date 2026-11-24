@@ -33,9 +33,11 @@ TOOLS = [
          "periods": {"type": "string", "enum": ["last_complete", "current", "season"]},
          "stage_method": {"type": "string", "enum": ["dominant", "midpoint"]},
          "output_target": {"type": "string", "enum": ["gcs", "gdrive", "both", "local"]},
-         "season": {"type": "string", "enum": list(pl.SEASONS),
-                    "description": "dry (Semester_1 planting months, ~Oct-Dec) or wet "
-                                   "(Semester_2, ~May-Jun); switches the planting-month column"},
+         "season": {"type": "string", "enum": ["auto"] + list(pl.SEASONS),
+                    "description": "auto (default: planting months from both Semester_1 and "
+                                   "Semester_2, the data decides each pixel's crop cycle — for "
+                                   "provinces where the seasons overlap), dry (Semester_1 only, "
+                                   "~Oct-Dec) or wet (Semester_2 only, ~May-Jun)"},
          "season_year": {"type": "integer",
                          "description": "harvest year naming the season: dry2026 = planted "
                                         "Oct-Dec 2025; wet2026 = planted May-Jun 2026"},
