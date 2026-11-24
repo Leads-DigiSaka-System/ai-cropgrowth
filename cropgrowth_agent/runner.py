@@ -62,10 +62,17 @@ class RunConfig:
     #                 2026); wet2026 = planted May-Jun 2026. None -> from `year`, else the season
     #                 in progress today
     #   year          legacy: the PLANTING year of the season's main months (2025 -> dry2026 / wet2025)
-    plant_mo_col: str = None
+    plant_mo_col: str = None               # None (and season None) -> season 'auto' (see below)
     vector_layer: str = None               # layer of a multi-layer GeoPackage; None -> the
                                            #   layer that has the province + planting-month columns
-    season: str = None
+    season: str = None                     # 'auto' (default) | 'dry' | 'wet'
+    #   auto: planting months are read from ALL season_columns (Semester_1 and Semester_2) and the
+    #         data decides, per pixel, which crop cycle each period belongs to: the window covers
+    #         every candidate season overlapping the periods being mapped, and up to max_cycles
+    #         crop cycles are found per pixel (a dry and a wet crop can share one window). Use it
+    #         where the two seasons' planting / harvest dates overlap. No column to choose.
+    season_columns: tuple = ("Semester_1", "Semester_2")
+    max_cycles: int = 2                    # auto mode: crop cycles per pixel (1 or 2)
     season_year: int = None
     year: int = None
     exclude: tuple = ()                    # provinces to skip (substring match), e.g. ("PALAWAN",)
@@ -94,19 +101,31 @@ class RunConfig:
     # ---- season resolution
     def season_name(self):
         by_col = pl.season_from_column(self.plant_mo_col)
+        if self.season == "auto":
+            return "auto"
         if self.season:
             if self.season not in pl.SEASONS:
-                raise ValueError(f"season must be one of {list(pl.SEASONS)}")
+                raise ValueError(f"season must be one of {['auto'] + list(pl.SEASONS)}")
             if by_col and by_col != self.season:
                 raise ValueError(f"plant_mo_col {self.plant_mo_col!r} is the {by_col} season's column, "
                                  f"but season={self.season!r}")
             return self.season
+        if not self.plant_mo_col:
+            return "auto"                                # nothing chosen: read both columns
         return by_col or "dry"
 
+    def is_auto(self):
+        return self.season_name() == "auto"
+
     def plant_col(self):
+        """The single planting-month column (None in auto mode, which reads season_columns)."""
+        if self.is_auto():
+            return None
         return self.plant_mo_col or pl.SEASON_COLUMNS[self.season_name()]
 
     def season_year_value(self):
+        if self.is_auto():
+            return None
         if self.season_year:
             return int(self.season_year)
         if self.year:                                   # legacy: planting year of the main months
@@ -114,22 +133,39 @@ class RunConfig:
         return pl.default_season_year(self.season_name())
 
     def planting_year(self, month):
+        if self.is_auto():                               # the most recent occurrence of that month
+            t = pd.Timestamp.today()
+            return t.year if month <= t.month else t.year - 1
         return pl.planting_year(month, self.season_name(), self.season_year_value())
 
     def fallback_month(self):
-        return int(self.planting_month_fallback or pl.SEASON_FALLBACK_MONTH[self.season_name()])
+        season = "dry" if self.is_auto() else self.season_name()
+        return int(self.planting_month_fallback or pl.SEASON_FALLBACK_MONTH[season])
 
     def label(self):
+        if self.is_auto():
+            return self.cog_label or "rice"
         return self.cog_label or pl.season_label(self.season_name(), self.season_year_value())
 
     def prefix(self):
+        if self.is_auto():
+            return self.output_prefix or "products/growth_stage/auto"
         return self.output_prefix or pl.season_prefix(self.season_name(), self.season_year_value())
 
-    def ref_year(self):
-        """Year whose Jan 1 the QA date bands count from (the planting year of the main months)."""
+    def ref_year(self, window=None):
+        """Year whose Jan 1 the QA date bands count from: the planting year of the main months
+        (auto mode: the year the processing window starts)."""
+        if self.is_auto():
+            return int(str(window[0])[:4]) if window else pd.Timestamp.today().year
         return self.planting_year(pl.SEASON_FALLBACK_MONTH[self.season_name()])
 
     def season_summary(self):
+        if self.is_auto():
+            return {"season": "auto", "planting_month_columns": list(self.season_columns),
+                    "max_cycles": self.max_cycles, "label": self.label(),
+                    "output_prefix": self.prefix(),
+                    "how": "candidate planting months from every column; each pixel's crop cycles "
+                           "come from the NDVI series"}
         f = self.fallback_month()
         s, e = dp.season_window(f, self.planting_year(f))
         return {"season": self.season_name(), "season_year": self.season_year_value(),
@@ -189,18 +225,18 @@ def _layer_columns(path, layer):
         return [c for c in gpd.read_file(path, layer=layer).columns if c != "geometry"]
 
 
-def read_vector(path, need, optional=(), layer=None, log=print):
-    """Read the layer of `path` that has every column in `need` (case / space
-    insensitive), renaming matched columns to the requested names. Raises a
-    ValueError listing every layer's columns when none has them."""
+def read_vector(path, need, optional=(), layer=None, log=print, need_any=()):
+    """Read the layer of `path` that has every column in `need` and at least one of
+    `need_any` (case / space insensitive), renaming matched columns to the requested
+    names. Raises a ValueError listing every layer's columns when none has them."""
     import geopandas as gpd
     layers = [layer] if layer else _list_layers(path)
     report = {}
     for lyr in layers:
         cols = _layer_columns(path, lyr)
-        found = _match_columns(cols, list(need) + [o for o in optional if o])
+        found = _match_columns(cols, list(need) + list(need_any) + [o for o in optional if o])
         report[lyr] = cols
-        if all(n in found for n in need):
+        if all(n in found for n in need) and (not need_any or any(n in found for n in need_any)):
             g = gpd.read_file(path, layer=lyr).to_crs(4326)
             rename = {a: w for w, a in found.items() if a != w}
             if rename:
@@ -216,8 +252,9 @@ def read_vector(path, need, optional=(), layer=None, log=print):
     lines = "\n".join(f"  layer {k!r}: {v}" for k, v in report.items())
     missing = sorted({n for n in need for cols in [report[next(iter(report))]]
                       if n not in _match_columns(cols, [n])})
+    want = list(need) + ([f"one of {list(need_any)}"] if need_any else [])
     raise ValueError(
-        f"{path} (last modified {modified}) has no layer with the column(s) {list(need)}; "
+        f"{path} (last modified {modified}) has no layer with the column(s) {want}; "
         f"missing in the first layer: {missing}.\n{lines}\n"
         "If you added the column recently, Colab may still be reading the old copy of the file "
         "from Google Drive: run `drive.mount('/content/drive', force_remount=True)` (or restart the "
@@ -255,7 +292,8 @@ class Runner:
         bad = sorted(set(changes) - valid)
         if bad:
             raise ValueError(f"unknown setting(s) {bad}")
-        checks = {"data_source": ("hls", "s2"), "cadence": pl.CADENCES, "season": pl.SEASONS,
+        checks = {"data_source": ("hls", "s2"), "cadence": pl.CADENCES,
+                  "season": ("auto",) + tuple(pl.SEASONS),
                   "periods": ("last_complete", "current", "season"),
                   "stage_method": ("dominant", "midpoint"),
                   "output_target": storage.TARGETS, "composite_method": ("max", "median")}
@@ -284,7 +322,7 @@ class Runner:
             self._store = None
             self.store                                       # fail now, not mid-run
         if {"vector_path", "vector_layer", "prov_col", "plant_mo_col", "season",
-                "region_col"} & set(changes):
+                "region_col", "season_columns"} & set(changes):
             self._prov_gdf = None
         if {"aoi_path", "aoi_name_col"} & set(changes):
             self._aoi_gdf = None
@@ -299,9 +337,13 @@ class Runner:
             c = self.cfg
             if not c.vector_path:
                 raise ValueError("vector_path (province boundaries) is not set")
-            need = [c.prov_col, c.plant_col()]
-            g = read_vector(c.vector_path, need, optional=[c.region_col] if c.region_col else [],
-                            layer=c.vector_layer, log=self.log)
+            opt = [c.region_col] if c.region_col else []
+            if c.is_auto():
+                g = read_vector(c.vector_path, [c.prov_col], optional=opt, layer=c.vector_layer,
+                                log=self.log, need_any=list(c.season_columns))
+            else:
+                g = read_vector(c.vector_path, [c.prov_col, c.plant_col()], optional=opt,
+                                layer=c.vector_layer, log=self.log)
             g[c.prov_col] = g[c.prov_col].map(_key)
             self._prov_gdf = g
         return self._prov_gdf
@@ -377,6 +419,77 @@ class Runner:
         s, e, pm = pl.season_window_for_months(months, c.season_name(), c.season_year_value())
         return {"pm": pm, "months": counts, "window": (s, e), "note": "; ".join(notes) or None}
 
+    def _candidates(self, units, prov):
+        """Auto mode: candidate (season, month) planting months of a province from every
+        season column (all rows; months on < 10 % of a column's rows ignored)."""
+        c = self.cfg
+        cands, months, notes = [], {}, []
+        rows = units.loc[units[c.prov_col] == prov]
+        for col in c.season_columns:
+            season = pl.season_from_column(col)
+            if col not in rows or season is None:
+                continue
+            good = [m for m in (pl.parse_month(v) for v in rows[col]) if m]
+            if not good:
+                continue
+            counts = dict(sorted(Counter(good).items()))
+            keep = [m for m, n in counts.items() if n >= max(1, 0.1 * len(good))]
+            months[col] = counts
+            cands += [(season, m) for m in keep]
+            if len(keep) < len(counts):
+                notes.append(f"{col}: months {sorted(set(counts) - set(keep))} on <10% of rows ignored")
+        if not cands:
+            cands = [(sn, pl.SEASON_FALLBACK_MONTH[sn]) for sn in pl.SEASONS]
+            notes.append("no usable planting month in "
+                         f"{list(c.season_columns)}: fallback months {[m for _, m in cands]}")
+        return cands, months, "; ".join(notes) or None
+
+    def _province_plan(self, units, prov, as_of):
+        """Periods to map and the processing window of one province.
+        -> {'periods', 'window' (start, end) or None, 'pm', 'months', 'note'}.
+        Single season: the season window of its planting month(s).
+        Auto: every candidate season (both columns, the years around as_of) whose window
+        overlaps the periods being mapped; the window spans all of them, so whichever crop
+        is in the field in those periods is inside it."""
+        c = self.cfg
+        as_of = pd.Timestamp(as_of).normalize()
+        if not c.is_auto():
+            info = self._planting(units, prov)
+            return {"periods": self.periods_for(info["window"], as_of), "window": info["window"],
+                    "pm": info["pm"], "months": info["months"], "note": info["note"]}
+        cands, months, note = self._candidates(units, prov)
+        wins = []
+        for _, m in cands:
+            for py in range(as_of.year - 2, as_of.year + 2):
+                s, e = dp.season_window(m, py)
+                wins.append((pd.Timestamp(s), pd.Timestamp(e), m))
+        end_incl = as_of + pd.Timedelta(days=1)
+        if c.periods == "season":                         # from the earliest season now running
+            running = [w for w in wins if w[0] <= as_of <= w[1]]
+            targets = ([p for p in pl.periods_between(min(w[0] for w in running), as_of, c.cadence)
+                        if p.end <= end_incl] if running else [])
+        elif c.periods == "current":
+            targets = [pl.period_of(as_of, c.cadence)]
+        else:
+            targets = [pl.last_complete_period(as_of, c.cadence)]
+        periods = [p for p in targets if any(w[0] < p.end and w[1] >= p.start for w in wins)]
+        if not periods:
+            return {"periods": [], "window": None, "pm": None, "months": months, "note": note}
+        lo, hi = periods[0].start, periods[-1].end
+        over = sorted(w for w in wins if w[0] < hi and w[1] >= lo)
+        window = (str(over[0][0].date()), str(max(w[1] for w in over).date()))
+        return {"periods": periods, "window": window, "pm": over[0][2], "months": months, "note": note}
+
+    def _pheno_cfg(self, window=None):
+        """Phenology settings for a run: auto mode follows the latest cycle over the whole
+        window and looks for one earlier cycle (max_cycles)."""
+        c = self.cfg
+        cfg = dict(c.pheno_cfg)
+        if c.is_auto() and window:
+            days = (pd.Timestamp(window[1]) - pd.Timestamp(window[0])).days + 1
+            cfg.update(PEAK_SELECT="last", PEAK_SEARCH_DAYS=(30, days), max_cycles=int(c.max_cycles))
+        return cfg
+
     def _pm_info(self, units, prov):
         info = self._planting(units, prov)
         return info["pm"], info["note"]
@@ -425,14 +538,14 @@ class Runner:
         rows, n_tiles = [], 0
         for prov in sorted(units[self.cfg.prov_col]):
             sub = units.loc[units[self.cfg.prov_col] == prov]
-            info = self._planting(units, prov)
-            pm, note = info["pm"], info["note"]
-            ps = self.periods_for(info["window"], as_of)
+            info = self._province_plan(units, prov, as_of)
+            pm, note, ps = info["pm"], info["note"], info["periods"]
             nt = len(dp.generate_tiles(tuple(sub.total_bounds), tile, geometry=sub))
             n_tiles += nt if ps else 0
-            s, e = info["window"]
-            rows.append({"province": prov, "planting_month": pm, "window": f"{s}..{e}", "tiles": nt,
-                         **({"planting_months": info["months"]} if len(info["months"]) > 1 else {}),
+            win = f"{info['window'][0]}..{info['window'][1]}" if info["window"] else None
+            rows.append({"province": prov, "planting_month": pm, "window": win, "tiles": nt,
+                         **({"planting_months": info["months"]}
+                            if self.cfg.is_auto() or len(info["months"]) > 1 else {}),
                          **({"note": note} if note else {}),
                          "periods": [p.label for p in ps]})
         return {"level": level, "names": names or [], "as_of": str(as_of.date()),
@@ -440,7 +553,8 @@ class Runner:
                 "tiles_to_process": n_tiles, "tile_deg": tile,
                 "data_source": self.cfg.data_source, "resolution_m": self.cfg.resolution_m,
                 "cadence": self.cfg.cadence, "periods_mode": self.cfg.periods,
-                "season": self.cfg.label(), "planting_month_column": self.cfg.plant_col(),
+                "season": self.cfg.label(),
+                "planting_month_column": self.cfg.plant_col() or list(self.cfg.season_columns),
                 "notes": sum("note" in r for r in rows),
                 "output": f"{self.store.describe()}/{self.cfg.prefix()}",
                 "detail": rows}
@@ -449,10 +563,14 @@ class Runner:
         c = self.cfg
         sub = units.loc[units[c.prov_col] == prov]
         cache = os.path.join(c.tile_cache_dir, _fname(prov)) if c.tile_cache_dir else None
-        info = self._planting(units, prov)
+        info = self._province_plan(units, prov, as_of)
+        if info["window"] is None:
+            return None
         pm = info["pm"]
-        pheno = pl.run_periodic_unit(sub, pm, c.planting_year(pm), as_of, window=info["window"],
-                                     tile_deg=c.effective_tile_deg(), pheno_cfg=c.pheno_cfg,
+        year = pd.Timestamp(info["window"][0]).year if c.is_auto() else c.planting_year(pm)
+        pheno = pl.run_periodic_unit(sub, pm, year, as_of, window=info["window"],
+                                     tile_deg=c.effective_tile_deg(),
+                                     pheno_cfg=self._pheno_cfg(info["window"]),
                                      cache_dir=cache, tile_workers=c.tile_workers,
                                      date_median_radius=c.date_median_radius)
         if pheno is not None:
@@ -479,7 +597,8 @@ class Runner:
                                          if r["hectares"] > 0}})
             if c.save_phenology_bands:
                 local = os.path.join(tmp, os.path.basename(self._qa_rel(prov)))
-                ph.write_cog(pheno, local, ref_year=c.ref_year())
+                ph.write_cog(pheno, local, ref_year=c.ref_year((pheno.attrs.get("window_start"),)),
+                             bands=ph.QA_BANDS_TWO_CYCLES if ph.PREV + "qc" in pheno else None)
                 self.store.put(local, self._qa_rel(prov))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -496,9 +615,12 @@ class Runner:
         """
         c = self.cfg
         sub = units.loc[units[c.prov_col] == prov]
-        info = self._planting(units, prov)
+        info = self._province_plan(units, prov, as_of)
+        if info["window"] is None:
+            return None
         pm = info["pm"]
-        win = pl.periodic_window(pm, c.planting_year(pm), as_of, info["window"])
+        year = pd.Timestamp(info["window"][0]).year if c.is_auto() else c.planting_year(pm)
+        win = pl.periodic_window(pm, year, as_of, info["window"])
         if win is None:
             return None
         bbox = tuple(float(v) for v in sub.total_bounds)
@@ -511,11 +633,13 @@ class Runner:
                                        tags={**tags, "period": p.label,
                                              "period_dates": f"{p.start.date()}..{p.end.date()}"})
                    for p in periods}
-        qa = (GridWriter(bbox, res, len(ph.QA_BANDS), "int16", ph.QA_NODATA, band_names=ph.QA_BANDS,
-                         tags={**tags, **ph.qa_tags(c.ref_year(), f"{win[0]}..{win[1]}")})
+        pcfg = self._pheno_cfg(win)
+        qa_bands = ph.QA_BANDS_TWO_CYCLES if pcfg.get("max_cycles", 1) >= 2 else ph.QA_BANDS
+        ref_year = c.ref_year(win)
+        qa = (GridWriter(bbox, res, len(qa_bands), "int16", ph.QA_NODATA, band_names=qa_bands,
+                         tags={**tags, **ph.qa_tags(ref_year, f"{win[0]}..{win[1]}")})
               if c.save_phenology_bands else None)
         all_writers = list(writers.values()) + ([qa] if qa else [])
-        pcfg = dict(c.pheno_cfg)
 
         def sink(t, tb):
             w, s_, e, n = tb                         # each pixel belongs to exactly one tile
@@ -532,13 +656,13 @@ class Runner:
                     st = st.copy(data=ph.majority_filter(st.values, c.stage_majority_radius))
                 writers[p.label].write(st.values, ys, xs)
             if qa is not None:
-                qa.write(ph.encode_qa_bands(t, c.ref_year()), ys, xs)
+                qa.write(ph.encode_qa_bands(t, ref_year, qa_bands), ys, xs)
 
         cache = os.path.join(c.tile_cache_dir, _fname(prov)) if c.tile_cache_dir else None
         tmp = tempfile.mkdtemp(prefix="cropgrowth_")
         try:
             done = dp.build_province_datacube_tiled(
-                bbox, pm, c.planting_year(pm), tile_deg=c.effective_tile_deg(), geometry=sub,
+                bbox, pm, year, tile_deg=c.effective_tile_deg(), geometry=sub,
                 cache_dir=cache, tile_workers=c.tile_workers, window=win,
                 cache_tag=pl._cfg_tag(pcfg), per_tile_fn=lambda ds: ph.run_phenology(ds, **pcfg),
                 tile_sink=sink)
@@ -594,7 +718,7 @@ class Runner:
         scope = scope or self._scope_name(level, names)
         expected = {}                                     # period label -> provinces in season
         for prov in provs:
-            for p in self.periods_for(self._planting(units, prov)["window"], as_of):
+            for p in self._province_plan(units, prov, as_of)["periods"]:
                 expected.setdefault(p.label, []).append(prov)
         labels = list(periods) if periods else sorted(expected)
         self.store.refresh(c.prefix() + "/")
@@ -653,7 +777,7 @@ class Runner:
         if skip_existing:
             self.store.refresh(self.cfg.prefix() + "/")
         for prov in tqdm(provs, desc="provinces", unit="prov"):
-            ps = self.periods_for(self._planting(units, prov)["window"], as_of)
+            ps = self._province_plan(units, prov, as_of)["periods"]
             if not ps:
                 res["out_of_season"].append(prov); continue
             if skip_existing and all(self.store.exists(self._stage_rel(prov, p)) for p in ps):

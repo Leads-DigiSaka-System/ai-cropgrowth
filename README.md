@@ -14,12 +14,13 @@ products/growth_stage/recent/                      municipal / barangay: the sta
 ├── SCIENCE_CITY_OF_MUÑOZ_20261002_summary.csv     pixels, hectares, % of cropland per stage
 └── runs/recent_<timestamp>.csv                    what ran, where it went, failures
 
-products/growth_stage/2026/dry/                    provincial / regional / national: one map per period
-├── dry2026_BULACAN_202609.tiff                    monthly (…_202609H1 / H2 when semimonthly)
-├── summary/dry2026_BULACAN_202609.csv             hectares per stage
-├── qa/dry2026_BULACAN_phenology_dates.tiff        optional: the 8 transition dates + QC bands
-├── mosaic/dry2026_PHILIPPINES_202609.tiff         all provinces of the run in one COG (regional: _REGION_III_)
-├── mosaic/dry2026_PHILIPPINES_202609_summary.csv  hectares per stage for the whole mosaic
+products/growth_stage/auto/                        provincial / regional / national: one map per period
+                                                   (auto season; one column: products/growth_stage/2026/dry/)
+├── rice_BULACAN_202609.tiff                    monthly (…_202609H1 / H2 when semimonthly)
+├── summary/rice_BULACAN_202609.csv             hectares per stage
+├── qa/rice_BULACAN_phenology_dates.tiff        optional: the 8 transition dates + QC bands
+├── mosaic/rice_PHILIPPINES_202609.tiff         all provinces of the run in one COG (regional: _REGION_III_)
+├── mosaic/rice_PHILIPPINES_202609_summary.csv  hectares per stage for the whole mosaic
 └── runs/periodic_<timestamp>.csv
 ```
 
@@ -82,9 +83,29 @@ HLS v2 (Landsat 8/9 + Sentinel-2) or Sentinel-2 L2A  (Microsoft Planetary Comput
   young crop isn't mistaken for the previous harvested one. `data_age_days` shows how stale each pixel's stage
   is: Sentinel-2 / Landsat revisit every few days, but clouds can hide a field for weeks.
 
-### Seasons
+### Seasons: auto (default) or one column
 
-The planting-month column of the province file chooses the season:
+**Auto (default; `season='auto'`, or no `plant_mo_col`).** In many provinces the dry-season (`Semester_1`) and
+wet-season (`Semester_2`) planting and harvest dates overlap, so picking one column misses crops. Auto mode reads
+both columns and lets the NDVI series decide:
+
+- **Candidates:** every planting month in `Semester_1` and `Semester_2`, from all of a province's rows, is a
+  candidate. A province with only one column filled uses that one.
+- **Window:** every candidate season whose window (1 month before planting to 6 months after) overlaps the
+  periods being mapped is included, and the processing window spans them all. Whichever crop is in the field in
+  those periods is inside it.
+- **Two crop cycles per pixel** (`max_cycles=2`): the latest cycle is found first, then the series is cut at that
+  cycle's starting trough and searched again for the cycle before it (`prev_*` bands). A dry and a wet crop in one
+  window each get their own dates.
+- **Classification:** each period is classified by the cycle that covers it. Between one crop's harvest and the
+  next planting it reads post-harvest, then pre-planting. A single-cycle run in the same window would see only one
+  of the two crops.
+- **Outputs:** `rice_<PROVINCE>_<period>.tiff` under `products/growth_stage/auto` (set `cog_label` /
+  `output_prefix` to change). With `save_phenology_bands`, the QA file also holds the earlier cycle's dates
+  (`prev_*`).
+
+**One column (single season).** Set `plant_mo_col` (or `season='dry'` / `'wet'`) to process one season the way
+it worked before:
 
 | `plant_mo_col` | Season | Usual planting | Named by its harvest year (`season_year`) | Fallback month |
 |---|---|---|---|---|
@@ -241,7 +262,10 @@ python -m cropgrowth_agent outputs     --config config.json --kind periodic
 | `cadence` | `monthly` | `monthly` or `semimonthly` |
 | `periods` | `last_complete` | `last_complete`, `current` or `season` |
 | `stage_method` | `dominant` | Stage that fills most of the period, or `midpoint` |
-| `plant_mo_col` | `Semester_1` | Planting-month column: `Semester_1` = dry season, `Semester_2` = wet season |
+| `season` | `auto` | `auto` = planting months from both columns, up to 2 crop cycles per pixel; `dry` / `wet` = one season |
+| `plant_mo_col` | none (auto) | One planting-month column instead: `Semester_1` = dry season, `Semester_2` = wet season |
+| `season_columns` | `Semester_1`, `Semester_2` | Columns auto mode reads |
+| `max_cycles` | 2 | Auto mode: crop cycles per pixel |
 | `season_year` | season in progress | Harvest year naming the season (`dry2026`, `wet2026`) |
 | `planting_month_fallback` | 12 dry / 6 wet | Month used when a province has no planting month |
 | `lookback_days` | 240 | Recent-mode window |
